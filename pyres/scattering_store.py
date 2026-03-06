@@ -307,7 +307,8 @@ class ResonatorScatteringStore(pd.HDFStore):
         else:
             ret = None
 
-        # - perform environmental calibration - # 
+        # - perform environmental calibration - #
+        j = 0 
         for i, val in zip(inds, sweep_param_vals):
             ind = self.record_start_inds[i]
             rg, rgi = self.rg[ind], self.rgi[ind]
@@ -316,7 +317,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             except TypeError:
                 fb = frequency_bound
             else:
-                fb = frequency_bound[i] 
+                fb = frequency_bound[j] 
             if param != 'iter':
                 sweep_val = self._get_group_values(group, i, param=param, frequency_bound=fb)
             else:
@@ -392,6 +393,7 @@ class ResonatorScatteringStore(pd.HDFStore):
                 )
             )
             self.append('temp_params', cal_params_df)
+            j += 1
 
         if '/cal_data' in self.keys():
             self.remove('/cal_data')
@@ -1126,14 +1128,7 @@ class ResonatorScatteringStore(pd.HDFStore):
         """
         if inds is None:
             inds = np.arange(self.record_start_inds.shape[0])
-        if xparam is None:
-            xparam_vals = np.arange(self.record_start_inds.shape[0])
-            xparam='iter' 
-        else:
-            group, param = xparam.split('.') 
-            xparam_vals = self[group][param].values
-        xmin, xmax = xparam_vals.min(), xparam_vals.max() 
-        
+
         # - configure plot - # 
         fig, axs = plt.subplot_mosaic(
             [['fr', 'Ql'], 
@@ -1143,11 +1138,6 @@ class ResonatorScatteringStore(pd.HDFStore):
             xlabel='' if xparam_label is None else xparam_label,
             ylabel=r'$f_r$ (GHz.)',
         )
-        # axs['IQ'].set(
-        #     xlabel=r'$\mathcal{R}\{S_{%s}\}$' % self.sparam,
-        #     ylabel=r'$\mathcal{I}\{S_{%s}\}$' % self.sparam,
-        #     aspect='equal',
-        # )
         axs['Ql'].set(
             xlabel='' if xparam_label is None else xparam_label,
             ylabel=r'$Q_l$', 
@@ -1163,24 +1153,24 @@ class ResonatorScatteringStore(pd.HDFStore):
         ql = res_params.Ql.values
         qi, qc = res_params.Qi.values, res_params.Qc.values.real 
         if xparam == 'iter':
-            x = np.arange(res_params.shape[0])
+            x = np.arange(res_params.shape[0])[inds]
         else:
             xparam_split = xparam.split('.') 
             group, param = xparam_split 
-            x = self[group][param].values
+            x = self[group][param].values[inds]
 
         # - plot - #
         axs['fr'].scatter(
-            x, fr*1e-9, marker='.' 
+            x, fr*1e-9 
         )
         axs['Ql'].scatter(
-            x, ql, marker='.'
+            x, ql
         )
         axs['Q'].scatter(
-            x, qi, marker='.', label=r'$Q_i$'
+            x, qi, label=r'$Q_i$'
         )
         axs['Q'].scatter(
-            x, qc, marker='.', label=r'$Q_c$'
+            x, qc, label=r'$Q_c$'
         )
         axs['Q'].legend()
 
