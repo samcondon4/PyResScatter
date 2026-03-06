@@ -2,9 +2,12 @@
 
 Individual helper functions useful for resonator data analysis.
 """
+import os
 import numpy as np
+import pandas as pd
 from scipy import stats
 import scipy.optimize as spopt
+from datetime import datetime
 
 
 def connect_bluefors_logs_to_store(log_path, store):
@@ -13,7 +16,34 @@ def connect_bluefors_logs_to_store(log_path, store):
     :param log_path: Path to a directory with all of the bluefors log files to link to the HDFStore object.
     :param store: HDFStore object with resonator data to be linked to bluefors logs.
     """ 
-    pass
+    # - vectorized datetime conversion functions - # 
+    to_datetime_meta = np.vectorize(lambda x: datetime.strptime(x, '%Y%m%d_%H%M%S')) 
+    to_datetime_temp = np.vectorize(lambda x: datetime.strptime(x, '%d-%m-%y %H:%M:%S'))
+
+    # - make datetime array from meta group, write back to the dataframe - #
+    meta = store.meta
+    meta['datetime'] = to_datetime_meta(meta.timestamp.values)
+
+    # - construct temperature and datetime dataframe - # 
+    files = [f for f in os.listdir(log_path) if f.endswith('log')]
+    temp_df = pd.concat(
+        [pd.read_csv(
+            os.path.sep.join([log_path, f]),
+            names=['date', 'time', 'temperature'] 
+        ) for f in files]
+    )
+    dt_array = np.array([temp_df.date.values, temp_df.time.values]).T
+    dt_array = dt_array[:, 0] + " " + dt_array[:, 1]
+    dt_array = to_datetime_temp(dt_array)
+    temp_df = pd.DataFrame({
+        'datetime': dt_array,
+        'temperature': temp_df.temperature.values,
+    })
+
+    # - merge the dataframes, write back to the original store - #
+    merged_df = pd.merge_asof(meta, temp_df)
+    merged_df.index = meta.index
+    store.put('meta', merged_df, format='table')
 
 
 def csv_to_hdf(csv_path, hdf_path):

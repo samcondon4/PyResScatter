@@ -142,7 +142,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             param='iter' 
         else:
             group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values
+            sweep_param_vals = self[group][param].values[inds]
         sweep_min = sweep_param_vals.min()
         sweep_max = sweep_param_vals.max()
         fig, axs = None, None 
@@ -282,7 +282,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             param='iter' 
         else:
             group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values
+            sweep_param_vals = self[group][param].values[inds]
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         if plot:
@@ -432,7 +432,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             param='iter' 
         else:
             group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values
+            sweep_param_vals = self[group][param].values[inds]
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         if plot:
@@ -578,7 +578,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             param='iter' 
         else:
             group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values
+            sweep_param_vals = self[group][param].values[inds]
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         if plot:
@@ -726,7 +726,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             param='iter' 
         else:
             group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values
+            sweep_param_vals = self[group][param].values[inds]
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         if plot:
@@ -828,7 +828,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             param='iter' 
         else:
             group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values
+            sweep_param_vals = self[group][param].values[inds]
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         if plot:
@@ -962,7 +962,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             param='iter' 
         else:
             group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values
+            sweep_param_vals = self[group][param].values[inds]
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
@@ -1036,7 +1036,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             param='iter' 
         else:
             group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values
+            sweep_param_vals = self[group][param].values[inds]
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
