@@ -33,10 +33,22 @@ class ResonatorScatteringStore(pd.HDFStore):
         :param param: Parameter to pull from the dataframe. 
         :param frequency_bound: Frequency limits to take HDF group data between. 
         """
-        ind = self.record_start_inds[index] 
-        rg, rgi = self.rg[ind], self.rgi[ind] 
-        where_str = f'RecordGroup == "{rg}" & RecordGroupInd == "{rgi}"'
+        ind = self.record_start_inds[index]
+        try:
+            iter(ind)
+        except TypeError:
+            rg, rgi = self.rg[ind], self.rgi[ind] 
+            where_str = f'RecordGroup == "{rg}" & RecordGroupInd == "{rgi}"'
+        else:
+            rg, rgi = self.rg[ind], self.rgi[ind] 
+            rgmin, rgmax = rg.min(), rg.max()
+            rgimin, rgimax = rgi.min(), rgi.max()
+            where_str = ' & '.join([
+                    f'RecordGroup >= "{rgmin}" & RecordGroup <= "{rgmax}"',
+                    f'RecordGroupInd >= "{rgimin}" & RecordGroupInd <= "{rgimax}"'
+                ])
         df = self.select(group, where=where_str)
+        
         if frequency_bound is not None and 'frequency' in df.columns:
             freqs = df.frequency.values 
             inds = (frequency_bound[0] < freqs) * (freqs < frequency_bound[1])
@@ -952,6 +964,120 @@ class ResonatorScatteringStore(pd.HDFStore):
         return ret
 
     # - PLOTTING FUNCTIONS ----------------------------------------------------------------------- # 
+    def plot_mag(self,
+            frequency_bound=None, inds=None,
+            sweep_param=None, sweep_cmap='viridis', sweep_label=None,          
+    ): 
+        # - apply indices --------------- #
+        if inds is None:
+            inds = np.arange(self.record_start_inds.shape[0])
+        if sweep_param is None:
+            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
+            param='iter' 
+        else:
+            group, param = sweep_param.split('.') 
+            sweep_param_vals = self[group][param].values[inds]
+        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+
+        # - configure figure and axes objects - #
+        if '/cal_data' not in self.keys():
+            fig, axs = self._configure_subplot_mosaic(
+                [['mag_raw']],
+                sweep_param_vals,
+                width_ratios=[0.9, 0.1],
+                sweep_label=sweep_label,
+                sweep_cmap=sweep_cmap,
+            )
+        else:
+            fig, axs = self._configure_subplot_mosaic(
+                [['mag_raw', 'mag_cal']],
+                sweep_param_vals,
+                width_ratios=[0.45, 0.45, 0.1],
+                sweep_label=sweep_label,
+                sweep_cmap=sweep_cmap,    
+            )
+            axs['mag_cal'].set(
+                xlabel='Frequency (GHz.)',
+            )
+        axs['mag_raw'].set(
+            xlabel='Frequency (GHz.)',
+            ylabel=self.mag_ylabel
+        ) 
+
+        # - plot - #
+        for i, val in zip(inds, sweep_param_vals):
+            data = self._get_group_values('data', i, frequency_bound=frequency_bound)
+            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
+            freqs *= 1e-9 
+            mlog = (1 + self.power*1)*10*np.log10(np.sqrt(I**2 + Q**2)) 
+            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
+            axs['mag_raw'].plot(freqs, mlog, color=color)
+            if '/cal_data' in self.keys():
+                cal_data = self._get_group_values('cal_data', i)
+                Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
+                freqs_cal *= 1e-9 
+                mlog_cal = (1 + self.power*1)*10*np.log10(np.sqrt(Ical**2 + Qcal**2)) 
+                axs['mag_cal'].plot(freqs_cal, mlog_cal, color=color)
+
+        return fig, axs
+    
+    def plot_phase(self,
+            frequency_bound=None, inds=None,
+            sweep_param=None, sweep_cmap='viridis', sweep_label=None,          
+    ): 
+        # - apply indices --------------- #
+        if inds is None:
+            inds = np.arange(self.record_start_inds.shape[0])
+        if sweep_param is None:
+            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
+            param='iter' 
+        else:
+            group, param = sweep_param.split('.') 
+            sweep_param_vals = self[group][param].values[inds]
+        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+
+        # - configure figure and axes objects - #
+        if '/cal_data' not in self.keys():
+            fig, axs = self._configure_subplot_mosaic(
+                [['phase_raw']],
+                sweep_param_vals,
+                width_ratios=[0.9, 0.1],
+                sweep_label=sweep_label,
+                sweep_cmap=sweep_cmap,
+            )
+        else:
+            fig, axs = self._configure_subplot_mosaic(
+                [['phase_raw', 'phase_cal']],
+                sweep_param_vals,
+                width_ratios=[0.45, 0.45, 0.1],
+                sweep_label=sweep_label,
+                sweep_cmap=sweep_cmap,    
+            )
+            axs['phase_cal'].set(
+                xlabel='Frequency (GHz.)',
+            )
+        axs['phase_raw'].set(
+            xlabel='Frequency (GHz.)',
+            ylabel=self.phase_ylabel
+        ) 
+
+        # - plot - #
+        for i, val in zip(inds, sweep_param_vals):
+            data = self._get_group_values('data', i, frequency_bound=frequency_bound)
+            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
+            freqs *= 1e-9 
+            phase = np.unwrap(np.arctan2(Q, I)) 
+            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
+            axs['phase_raw'].plot(freqs, phase, color=color)
+            if '/cal_data' in self.keys():
+                cal_data = self._get_group_values('cal_data', i)
+                Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
+                freqs_cal *= 1e-9 
+                phase_cal = np.unwrap(np.arctan2(Qcal, Ical)) 
+                axs['phase_cal'].plot(freqs_cal, phase_cal, color=color)
+
+        return fig, axs
+
     def plot_mag_phase(self,
             frequency_bound=None, inds=None,
             sweep_param=None, sweep_cmap='viridis', sweep_label=None,          
@@ -1147,17 +1273,18 @@ class ResonatorScatteringStore(pd.HDFStore):
             ylabel=r'$Q$', 
         )
 
-        # - extract resonator parameters and x sweep value - # 
-        res_params = self.res_params
+        # - extract resonator parameters and x sweep value - #
+        res_params = self._get_group_values('res_params', inds) 
         fr = res_params.fr.values
         ql = res_params.Ql.values
         qi, qc = res_params.Qi.values, res_params.Qc.values.real 
-        if xparam == 'iter':
+        if xparam is None: 
             x = np.arange(res_params.shape[0])[inds]
         else:
             xparam_split = xparam.split('.') 
             group, param = xparam_split 
-            x = self[group][param].values[inds]
+            group_df = self._get_group_values(group, inds) 
+            x = group_df[param].values
 
         # - plot - #
         axs['fr'].scatter(

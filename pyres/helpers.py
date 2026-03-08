@@ -26,6 +26,7 @@ def connect_bluefors_logs_to_store(log_path, store):
 
     # - construct temperature and datetime dataframe - # 
     files = [f for f in os.listdir(log_path) if f.endswith('log')]
+    files.sort()
     temp_df = pd.concat(
         [pd.read_csv(
             os.path.sep.join([log_path, f]),
@@ -34,7 +35,7 @@ def connect_bluefors_logs_to_store(log_path, store):
     )
     dt_array = np.array([temp_df.date.values, temp_df.time.values]).T
     dt_array = dt_array[:, 0] + " " + dt_array[:, 1]
-    dt_array = to_datetime_temp(dt_array)
+    dt_array = np.sort(to_datetime_temp(dt_array))
     temp_df = pd.DataFrame({
         'datetime': dt_array,
         'temperature': temp_df.temperature.values,
