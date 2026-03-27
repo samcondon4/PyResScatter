@@ -55,16 +55,16 @@ def csv_to_hdf(csv_path, hdf_path, meta_parameter=None):
     :param meta_parameter: Parameter to include in the meta group and to base the index sweep off of. 
     """
     # - open csv data file - # 
-    df = pd.read_csv(csv_path)
+    csv_df = pd.read_csv(csv_path)
     if meta_parameter is not None:
-        mp = df[meta_parameter].values
+        mp = csv_df[meta_parameter].values
     else:
         mp = None
-    
+
     # - write to HDF store - # 
     with pd.HDFStore(hdf_path) as store:
         for i, m in enumerate(np.unique(mp)):
-            dfm = df.query(f'{meta_parameter} == m')
+            dfm = csv_df.query(f'{meta_parameter} == {m}')
             N = dfm.shape[0]
             data_index = pd.MultiIndex.from_product(
                 [['000000'], ['%06i' % i], ['%06i' % j for j in np.arange(N)]],
