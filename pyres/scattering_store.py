@@ -966,7 +966,8 @@ class ResonatorScatteringStore(pd.HDFStore):
     # - PLOTTING FUNCTIONS ----------------------------------------------------------------------- # 
     def plot_mag(self,
             frequency_bound=None, inds=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None,          
+            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
+            cal=True,          
     ): 
         # - apply indices --------------- #
         if inds is None:
@@ -980,7 +981,7 @@ class ResonatorScatteringStore(pd.HDFStore):
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
-        if '/cal_data' not in self.keys():
+        if '/cal_data' not in self.keys() or not cal:
             fig, axs = self._configure_subplot_mosaic(
                 [['mag_raw']],
                 sweep_param_vals,
@@ -1012,7 +1013,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             mlog = (1 + self.power*1)*10*np.log10(np.sqrt(I**2 + Q**2)) 
             color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
             axs['mag_raw'].plot(freqs, mlog, color=color)
-            if '/cal_data' in self.keys():
+            if '/cal_data' in self.keys() and cal:
                 cal_data = self._get_group_values('cal_data', i)
                 Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
                 freqs_cal *= 1e-9 
@@ -1023,7 +1024,8 @@ class ResonatorScatteringStore(pd.HDFStore):
     
     def plot_phase(self,
             frequency_bound=None, inds=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None,          
+            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
+            cal=True,          
     ): 
         # - apply indices --------------- #
         if inds is None:
@@ -1037,7 +1039,7 @@ class ResonatorScatteringStore(pd.HDFStore):
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
-        if '/cal_data' not in self.keys():
+        if '/cal_data' not in self.keys() or not cal:
             fig, axs = self._configure_subplot_mosaic(
                 [['phase_raw']],
                 sweep_param_vals,
@@ -1069,7 +1071,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             phase = np.unwrap(np.arctan2(Q, I)) 
             color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
             axs['phase_raw'].plot(freqs, phase, color=color)
-            if '/cal_data' in self.keys():
+            if '/cal_data' in self.keys() and cal:
                 cal_data = self._get_group_values('cal_data', i)
                 Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
                 freqs_cal *= 1e-9 
@@ -1080,7 +1082,8 @@ class ResonatorScatteringStore(pd.HDFStore):
 
     def plot_mag_phase(self,
             frequency_bound=None, inds=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None,          
+            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
+            cal=True,          
         ):
         # - apply indices --------------- #
         if inds is None:
@@ -1094,7 +1097,7 @@ class ResonatorScatteringStore(pd.HDFStore):
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
-        if '/cal_data' not in self.keys():
+        if '/cal_data' not in self.keys() or not cal:
             fig, axs = self._configure_subplot_mosaic(
                 [['mag_raw'], ['phase_raw']],
                 sweep_param_vals,
@@ -1131,7 +1134,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
             axs['mag_raw'].plot(freqs, mlog, color=color)
             axs['phase_raw'].plot(freqs, phase, color=color) 
-            if '/cal_data' in self.keys():
+            if '/cal_data' in self.keys() and cal:
                 cal_data = self._get_group_values('cal_data', i)
                 Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
                 freqs_cal *= 1e-9 
@@ -1145,7 +1148,8 @@ class ResonatorScatteringStore(pd.HDFStore):
     def plot_iq(self,
         frequency_bound=None, inds=None,
         sweep_param=None, cal_sweep_param=None, 
-        sweep_cmap='viridis', sweep_label=None, 
+        sweep_cmap='viridis', sweep_label=None,
+        cal=True, 
     ):
         """ Plot IQ data.
 
@@ -1168,7 +1172,7 @@ class ResonatorScatteringStore(pd.HDFStore):
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
-        if '/cal_data' not in self.keys():
+        if '/cal_data' not in self.keys() or not cal:
             fig, axs = self._configure_subplot_mosaic(
                 [['iq_raw']],
                 sweep_param_vals,
@@ -1204,7 +1208,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
             freqs *= 1e-9 
             axs['iq_raw'].scatter(I, Q, marker='.', color=color)
-            if '/cal_data' in self.keys(): 
+            if '/cal_data' in self.keys() and cal: 
                 cal_data = self._get_group_values('cal_data', i)
                 Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
                 freqs_cal *= 1e-9 
