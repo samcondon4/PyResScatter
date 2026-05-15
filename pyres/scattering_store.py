@@ -222,7 +222,7 @@ class ResonatorScatteringStore(pd.HDFStore):
                 fit_func = lambda freqs, offset: self._line_func(freqs, tau, offset)
                 popt, pcov = spopt.curve_fit(fit_func, fit_freqs, fit_phase)
                 tau_fit = tau 
-                offset_fit = popt[1] 
+                offset_fit = popt[0] 
             else: # - tau is not None and offset is not None
                 tau_fit = tau
                 offset_fit = offset 
@@ -324,12 +324,10 @@ class ResonatorScatteringStore(pd.HDFStore):
         for i, val in zip(inds, sweep_param_vals):
             ind = self.record_start_inds[i]
             rg, rgi = self.rg[ind], self.rgi[ind]
-            try:
-                iter(frequency_bound)
-            except TypeError:
-                fb = frequency_bound
-            else:
+            if len(frequency_bound) > 2:
                 fb = frequency_bound[j] 
+            else:
+                fb = frequency_bound
             if param != 'iter':
                 sweep_val = self._get_group_values(group, i, param=param, frequency_bound=fb)
             else:
