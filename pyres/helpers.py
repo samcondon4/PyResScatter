@@ -3,6 +3,7 @@
 Individual helper functions useful for resonator data analysis.
 """
 import os
+import itertools
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -84,6 +85,25 @@ def csv_to_hdf(csv_path, hdf_path, meta_parameter=None):
             }, index=meta_index)
             store.append('data', df)
             store.append('meta', meta_df)
+
+
+def make_substore_from_condition(store, new_store_path, group, condition):
+    """ Make a new HDF file from a subset of data within a passed in store.
+    
+    :param store: HDFStore object from which to select data for the new file.
+    :param new_store_path: File path for the new HDF file. 
+    :param group: Group containing the column that defines the data subselection condition.
+    Should be passed as a string in the format 'group.parameter'.
+    :param condition: String condition on which to subselect data. An example would
+    be: 'parameter == X' 
+    """
+    keys = store.keys() 
+    df = store[group]
+    subdf = df.query(condition)
+    with pd.HDFStore(new_store_path) as new_store:
+        for ind, key in itertools.product(subdf.index, keys):
+            data = store.select(key, where=f'RecordGroup == "{ind[0]}" & RecordGroupInd == "{ind[1]}"')
+            new_store.append(key[1:], data)
 
 
 def circle_fit(sdata):
