@@ -106,6 +106,82 @@ def make_substore_from_condition(store, new_store_path, group, condition):
             new_store.append(key[1:], data)
 
 
+def store_concatenate(stores, output_filepath, in_groups=None):
+    """
+    Combines a list of ResonatorScatteringStore (or pd.HDFStore) objects into a 
+    single new .hdf file.
+    
+    :param stores: A list of the store objects to be merged.
+    :type stores: list of pd.HDFStore
+    :param output_filepath: The file path where the new combined HDF5 file will be saved.
+    :type output_filepath: str
+    :param in_groups: A list of groups to include in the merge (e.g., ['/base']). Defaults to ['/base'].
+    :type in_groups: list of str, optional
+    
+    .. note::
+        - RecordGroup strings (0-padded) are automatically re-indexed across stores 
+          to prevent collisions.
+        - Only subgroups present in ALL provided stores for the specified in_groups 
+          will be included in the final file.
+    """
+    if in_groups is None:
+        in_groups = ["/base"]
+        
+    # 1. Discover common subgroups across ALL stores using intersection
+    common_keys = set(stores[0].keys())
+    for store in stores[1:]:
+        common_keys.intersection_update(store.keys())
+        
+    # 2. Filter common_keys to only include those under the specified in_groups
+    keys_to_merge = []
+    for key in common_keys:
+        for ig in in_groups:
+            # Ensure we match exactly the group or a subgroup (e.g., '/base' or '/base/data')
+            ig_prefix = ig if ig.endswith('/') else ig + '/'
+            if key == ig or key.startswith(ig_prefix):
+                keys_to_merge.append(key)
+                break  # Stop checking other in_groups for this key
+                
+    # Sorting ensures standard deterministic processing order (e.g. data before meta)
+    keys_to_merge = sorted(keys_to_merge)
+
+    # 3. Setup global RecordGroup counter and store mappings
+    global_rg_counter = 0
+    store_mappings = [{} for _ in stores]
+    
+    # 4. Process and merge
+    with pd.HDFStore(output_filepath, mode='w') as out_store:
+        for key in keys_to_merge:
+            dfs_to_concat = []
+            
+            for store_idx, store in enumerate(stores):
+                df = store.get(key)
+                    
+                # -- Handle RecordGroup index re-numbering --
+                # Extract unique RecordGroups for the current dataframe
+                used_rgs = df.index.get_level_values('RecordGroup').unique()
+                
+                # Register any newly seen RecordGroups for this specific store
+                for rg in used_rgs:
+                    if rg not in store_mappings[store_idx]:
+                        store_mappings[store_idx][rg] = f"{global_rg_counter:06d}"
+                        global_rg_counter += 1
+                        
+                # Update the MultiIndex level extremely fast without copying the dataframe data
+                level_idx = df.index.names.index('RecordGroup')
+                old_levels = df.index.levels[level_idx]
+                new_levels = [store_mappings[store_idx].get(rg, rg) for rg in old_levels]
+                
+                df.index = df.index.set_levels(new_levels, level='RecordGroup')
+                dfs_to_concat.append(df)
+                
+            # Combine across stores and write to the new HDF5 file
+            if dfs_to_concat:
+                combined_df = pd.concat(dfs_to_concat)
+                # Using format='table' aligns with typical pandas.HDFStore data accessibility 
+                out_store.put(key, combined_df, format='table')
+
+
 def circle_fit(sdata):
     """ Fit a circle to complex scattering data. Adapted from `Probst et. al. resonator_tools <https://github.com/sebastianprobst/resonator_tools>`_. 
     See `Probst et. al. 2015 <https://pubs.aip.org/aip/rsi/article/86/2/024706/360955>`_ for a detailed description of the algebraic circle fit technique
