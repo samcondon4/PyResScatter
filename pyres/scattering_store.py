@@ -1,3 +1,5 @@
+import os
+import tempfile
 import numpy as np
 from numpy.polynomial import Polynomial
 import pandas as pd
@@ -5,67 +7,87 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import scipy.optimize as spopt
 
-
 from .helpers import circle_fit
 
 
 class ResonatorScatteringStore(pd.HDFStore):
 
     def __init__(self, path, geometry, power=True, **kwargs):
+        # - Check for legacy flat structure before opening the file permanently - #
+        if os.path.exists(path):
+            needs_migration = False
+            key_mapping = {}
+            
+            with pd.HDFStore(path, mode='r') as tmp_store:
+                keys = tmp_store.keys()
+                flat_groups = ['/data', '/meta', '/proc_params']
+                for group in flat_groups:
+                    if group in keys:
+                        needs_migration = True
+                        key_mapping[group] = f'/base{group}'
+            
+            # If flat groups exist, migrate and repack them into /base in one pass
+            if needs_migration:
+                self._repack(path, key_mapping=key_mapping)
+        
+        # - Now initialize the parent class as normal - #
         super().__init__(path, mode='a', **kwargs)
+        
         assert geometry in ['hanger', 'shunt'], 'Invalid geometry specified. The options are ["hanger", "shunt"]' 
         self.geometry = geometry 
-        self.data_storer = self.get_storer('data')
-        self.rg = self.data_storer.read_column('RecordGroup')
-        self.rgi = self.data_storer.read_column('RecordGroupInd')
-        self.rr = self.data_storer.read_column('RecordRow')
-        self.record_start_inds = np.where(self.rr == '000000')[0]
         self.power = power
         self.sparam = '21' if (self.geometry == 'hanger') else '11'
-        self.mag_ylabel = r'$|S_{%s}|$' % self.sparam 
+        self.mag_ylabel = r'$|S_{%s}|$ (dB)' % self.sparam 
         self.phase_ylabel = r'$\angle S_{%s}$ (rads)' % self.sparam 
-        keys = self.keys()
-        # - clean up fits that went bad and are still present in the file - # 
-        if '/temp_data' in keys:
-            self.remove('/temp_data')
-        if '/temp_params' in keys:
-            self.remove('/temp_params')
-
-    def _get_group_values(self, group, index, param=None, frequency_bound=None):
-        """ Return the dataframe from the group at the specified index.
-
-        :param group: String corresponding to the HDF group to pull the dataframe from.
-        :param index: Index from the RecordGroup and RecordGroupInd list to pull dataframe from.
-        :param param: Parameter to pull from the dataframe. 
-        :param frequency_bound: Frequency limits to take HDF group data between. 
-        """
-        ind = self.record_start_inds[index]
-        try:
-            iter(ind)
-        except TypeError:
-            rg, rgi = self.rg[ind], self.rgi[ind] 
-            where_str = f'RecordGroup == "{rg}" & RecordGroupInd == "{rgi}"'
-        else:
-            rg, rgi = self.rg[ind], self.rgi[ind] 
-            rgmin, rgmax = rg.min(), rg.max()
-            rgimin, rgimax = rgi.min(), rgi.max()
-            where_str = ' & '.join([
-                    f'RecordGroup >= "{rgmin}" & RecordGroup <= "{rgmax}"',
-                    f'RecordGroupInd >= "{rgimin}" & RecordGroupInd <= "{rgimax}"'
-                ])
-        df = self.select(group, where=where_str)
         
-        if frequency_bound is not None and 'frequency' in df.columns:
-            freqs = df.frequency.values 
-            inds = (frequency_bound[0] < freqs) * (freqs < frequency_bound[1])
-            df = df.iloc[inds]
-        if param is not None:
-            ret = df[param].values
-        else:
-            ret = df
+        self._index_cache = {}
+        
+        # - Clean up failed temporary groups from previous run crashes - #
+        keys = self.keys()
+        for k in keys:
+            if k.startswith('/tmp_') or '/tmp_avg_process' in k:
+                self.remove(k)
+        # (Note: Removing tmp files here will leave "dead space", but you can always
+        # run ResonatorScatteringStore.repack('my_file.h5') manually later if it gets bloated).
 
-        return ret
+        # - Cache indices for the base data group - #
+        if '/base/data' in self.keys() or 'base/data' in self.keys():
+            self._get_index_arrays('/base/data')
 
+    # - STATIC METHODS ------------------------------------------------------------------------------------------- #
+    @staticmethod
+    def _repack(filepath, key_mapping=None):
+        """ Repack an HDF5 file to reclaim disk space.
+        
+        :param filepath: Path to the HDF5 file.
+        :param key_mapping: Optional dictionary mapping old keys to new keys to rename groups 
+                            during the repacking process without doubling file size.
+        """
+        if not os.path.exists(filepath):
+            return
+            
+        key_mapping = key_mapping or {}
+        
+        # Create tmp file in the same directory to ensure atomic os.replace across filesystems
+        dir_name = os.path.dirname(os.path.abspath(filepath))
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.h5')
+        os.close(tmp_fd) # Close OS-level file descriptor so pandas can open it safely
+        
+        try:
+            with pd.HDFStore(filepath, mode='r') as store_in, pd.HDFStore(tmp_path, mode='w') as store_out:
+                for key in store_in.keys():
+                    df = store_in.select(key)
+                    new_key = key_mapping.get(key, key)
+                    store_out.put(new_key, df, format='table')
+                    
+            # Atomically replace the bloated file with the fresh, repacked file
+            os.replace(tmp_path, filepath)
+        except Exception as e:
+            # Clean up the temp file if something fails
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise e
+    
     @staticmethod
     def _compute_color(val, vmin, vmax, cmap='viridis'):
         """ Convert a value between a minimum and maximum to an integer between
@@ -88,6 +110,10 @@ class ResonatorScatteringStore(pd.HDFStore):
 
         return cmap(scaled)
 
+    @staticmethod
+    def _line_func(freqs, tau, offset):
+        return -2*np.pi*tau*freqs + offset
+    
     @staticmethod
     def _configure_subplot_mosaic(mosaic, sweep_param_vals, width_ratios=None, sweep_cmap='viridis', sweep_label=None):
         """ Configure a subplot mosaic and colorbar.
@@ -116,10 +142,6 @@ class ResonatorScatteringStore(pd.HDFStore):
 
         return fig, axs
 
-    @staticmethod
-    def _line_func(freqs, tau, offset):
-        return -2*np.pi*tau*freqs + offset
-
     @staticmethod 
     def _centered_phase_func(freqs, theta0, Ql, fr):
         return theta0 + 2*np.arctan(2*Ql*(1 - (freqs/fr)))
@@ -129,544 +151,806 @@ class ResonatorScatteringStore(pd.HDFStore):
 
         return params, pcov
 
-    # - CALIBRATION FUNCTIONS -------------------------------------------------------------------- #
-    def calibrate_cable_delay(self, 
-            tau=None, offset=None, 
-            frequency_bound=None, fit_frequency_bound=None, inds=None, cal=False, 
-            plot=False, sweep_param=None, sweep_cmap='viridis', sweep_label=None,
-        ):
-        """ Remove a line from the unwrapped phase data.
-        
-        :param tau: Fixed cable delay slope. If None a line will be fit to the unwrapped phase
-                    between the frequency bounds.
-        :param offset: Fixed cable delay offset. Behaves the same as above.
-        :param frequency_bound: Frequency range over which calibration should be performed. 
-        :param fit_frequency_bound: Frequency range over which a line fit should be performed. 
-        :param inds: Indices over which to perform the calibration. 
-        :param cal: Boolean to indicate if the existing calibration data should be used. 
-        :param plot: Boolean to indicate if a plot showing the calibration results should be generated. 
-        :param sweep_param: String to indicate a parameter that is swept over in the data.
-        :param sweep_cmap: Colormap to use to indicate the value of the swept parameter.
-        :param sweep_label: String label used to label the colorbar. 
-        """
-        # - apply indices ------------------------------------------------------------- # 
-        if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
+    # - INTERNAL HELPERS ---------------------------------------------------------------------------------------- #
+    def _get_group_values(self, group, index, param=None, frequency_bound=None, index_group=None):
+            """ Return the dataframe from the group at the specified index.
 
-        # - set up sweep parameter and plot ------------------------------------------- #
-        # - sweep parameter - # 
-        if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
-        else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
-        sweep_min = sweep_param_vals.min()
-        sweep_max = sweep_param_vals.max()
-        fig, axs = None, None 
-        if plot:
-            fig, axs = self._configure_subplot_mosaic(
-                [['phase_raw', 'iq_raw'], ['phase_cal', 'iq_cal']],
-                sweep_param_vals,
-                width_ratios=[0.45, 0.45, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-            axs['phase_cal'].set(
-                xlabel='Frequency (GHz.)',
-                ylabel=self.phase_ylabel,
-            )
-            axs['phase_raw'].set(
-                xlabel='Frequency (GHz.)', 
-                ylabel=self.phase_ylabel
-            )
-            axs['iq_cal'].set(
-                ylabel='Q',
-                xlabel='I'
-            )
-            axs['iq_raw'].set(
-                ylabel='Q',
-                xlabel='I',
-            )
-            ret = fig, axs
-        else:
-            ret = None
-
-        # - remove line from the data ------------------------------------------------- # 
-        try: 
-            for i, val in zip(inds, sweep_param_vals): 
-                ind = self.record_start_inds[i] 
-                rg, rgi = self.rg[ind], self.rgi[ind] 
-                if param != 'iter':
-                    sweep_val = self._get_group_values(group, i, param=param, frequency_bound=frequency_bound)
-                else:
-                    sweep_val = val 
-                data_group = 'data' if not cal else 'cal_data'
-                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound) 
-                freqs = data.frequency.values  
-                I, Q = data.I.values, data.Q.values
-                phase = np.unwrap(np.arctan2(Q, I))
-                mlin = np.sqrt(I**2 + Q**2)
-                if fit_frequency_bound is not None:
-                    inds = (fit_frequency_bound[0] < freqs) * (freqs < fit_frequency_bound[1])
-                    fit_freqs = freqs[inds]
-                    fit_phase = phase[inds]
-                    fit_mlin = mlin[inds]
-                else:
-                    fit_freqs = freqs
-                    fit_phase = phase
-                    fit_mlin = mlin
-                if (tau is None) and (offset is None):
-                    fit_func = self._line_func
-                    popt, pcov = spopt.curve_fit(fit_func, fit_freqs, fit_phase)
-                    tau_fit, offset_fit = popt
-                elif (tau is None) and (offset is not None):
-                    fit_func = lambda freqs, tau: self._line_func(freqs, tau, offset)
-                    popt, pcov = spopt.curve_fit(fit_func, fit_freqs, fit_phase)
-                    tau_fit = popt[0]
-                    offset_fit = offset 
-                elif (tau is not None) and (offset is None):
-                    fit_func = lambda freqs, offset: self._line_func(freqs, tau, offset)
-                    popt, pcov = spopt.curve_fit(fit_func, fit_freqs, fit_phase)
-                    tau_fit = tau 
-                    offset_fit = popt[0] 
-                else: # - tau is not None and offset is not None
-                    tau_fit = tau
-                    offset_fit = offset 
-                line = self._line_func(freqs, tau_fit, offset_fit)
-                corrected_phase = phase - line
-                Ical, Qcal = mlin*np.cos(corrected_phase), mlin*np.sin(corrected_phase)
-                # - write to store - # 
-                cal_df = pd.DataFrame({
-                    'frequency': freqs, 
-                    'I': Ical,
-                    'Q': Qcal,
-                }, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi], ['%06i' % j for j in np.arange(freqs.shape[0])]],
-                    names=['RecordGroup', 'RecordGroupInd', 'RecordRow'] 
-                    )
-                )
-                self.append('temp_data', cal_df) 
-                params_df = pd.DataFrame({
-                    'tau': tau_fit,
-                    'cable_delay_offset': offset_fit,
-                }, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi]],
-                    names=['RecordGroup', 'RecordGroupInd']
-                    )
-                ) 
-                self.append('temp_params', params_df) 
-                # - plotting - #
-                if plot:
-                    plot_freqs = freqs*1e-9
-                    color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap) 
-                    axs['phase_raw'].plot(plot_freqs, phase, color=color)
-                    axs['phase_raw'].plot(plot_freqs, line, ls=':', color='black')
-                    axs['phase_cal'].plot(plot_freqs, corrected_phase, color=color)
-                    axs['iq_raw'].scatter(I, Q, color=color, marker='.')
-                    axs['iq_cal'].scatter(Ical, Qcal, color=color, marker='.')
-
-            if '/cal_data' in self.keys():
-                self.remove('/cal_data')
-            self.get_node('/temp_data')._f_rename('cal_data') 
-
-            if '/cable_delay_params' in self.keys():
-                self.remove('/cable_delay_params') 
-            self.get_node('/temp_params')._f_rename('cable_delay_params')
-        
-        except Exception as e:
-            # - clean up the temp data groups if the fit errored - # 
-            keys = self.keys()
-            if '/temp_data' in keys: 
-                self.remove('/temp_data')
-            if '/temp_params' in keys: 
-                self.remove('/temp_params')
-
-            raise e
-
-        return ret
-
-    def calibrate_constant_scaling(self,
-            a=None, alpha=None, phase_fit_kwargs=None,
-            inds=None, plot=False, cal=False, frequency_bound=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None, 
-        ):
-        """ Calibrate a constant environmental attenuation and phase using the Probst method.
-        
-        :param a: Fixed attenuation/amplification factor.
-        :param alpha: Fixed phase shift factor.
-        :param phase_fit_kwargs: Keyword arguments to pass to the phase calibration fitting function. 
-        :param inds: Record start indices to calibrate over.
-        :param plot: Boolean to indicate if the calibration process should be plotted.
-        :param cal: Boolean to indicate if data from the 'cal_data' group should be used. 
-        :param sweep_param: String to indicate a swept parameter for a colorbar.
-        :param sweep_cmap: Colormap used to indicate the value of the swept parameter.
-        :param sweep_label: String label used to indicate the colorbar. 
-        """ 
-        # - apply indices --------------- #
-        if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
-        if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
-        else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
-
-        if plot:
-            fig, axs = self._configure_subplot_mosaic(
-                [['iq_raw', 'iq_process'], ['centered_phase', 'iq_final']],
-                sweep_param_vals=sweep_param_vals,
-                width_ratios=[0.45, 0.45, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-            for key, ax in axs.items():
-                if 'iq' in key:
-                    ax.set(
-                        xlabel='I',
-                        ylabel='Q'
-                    )
-            axs['centered_phase'].set(
-                xlabel='Frequency (GHz.)',
-                ylabel=self.mag_ylabel,
-            ) 
-            ret = fig, axs
-        else:
-            ret = None
-
-        # - perform environmental calibration - #
-        try: 
-            j = 0 
-            for i, val in zip(inds, sweep_param_vals):
-                ind = self.record_start_inds[i]
-                rg, rgi = self.rg[ind], self.rgi[ind]
-                if frequency_bound is not None and len(frequency_bound) > 2:
-                    fb = frequency_bound[j] 
-                else:
-                    fb = frequency_bound
-                if param != 'iter':
-                    sweep_val = self._get_group_values(group, i, param=param, frequency_bound=fb)
-                else:
-                    sweep_val = val 
-                data_group = 'data' if not cal else 'cal_data'
-                # - extract data to fit - # 
-                data = self._get_group_values(data_group, i, frequency_bound=fb)
-                I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
-                mlin = np.sqrt(I**2 + Q**2) 
-                phase = np.unwrap(np.arctan2(Q, I)) 
-                sdata = mlin*np.exp(1j*phase)
-
-                if plot:
-                    color = self._compute_color(sweep_val, sweep_min, sweep_max, sweep_cmap)
-                    plot_freqs = freqs*1e-9 
-                    axs['iq_raw'].scatter(I, Q, marker='.', color=color)
-
-                if (a is None) or (alpha is None): 
-                    # - fit a circle, translate to the center - #
-                    xc, yc, r = circle_fit(sdata)
-                    Icentered = I - xc
-                    Qcentered = Q - yc
-                    centered_phase = np.unwrap(np.arctan2(Qcentered, Icentered))
-
-                    # - run a phase fit on the translated circle - #
-                    phase_fit_kwargs = {} if phase_fit_kwargs is None else phase_fit_kwargs 
-                    params, pcov = self._centered_phase_fit(
-                        freqs, centered_phase,
-                        **phase_fit_kwargs
-                    )
-                    theta0, Ql, fr = params
-
-                    # - compute off resonant point, constant environmental scaling, and phase shift - #
-                    beta = (theta0 + np.pi)
-                    offres = xc + r*np.cos(beta) + 1j*(yc + r*np.sin(beta))
-                    afit, alphafit = np.abs(offres), np.arctan2(np.imag(offres), np.real(offres))
+            :param group: String corresponding to the hierarchical HDF group to pull the dataframe from.
+            :param index: Index from the RecordGroup and RecordGroupInd list to pull dataframe from.
+            :param param: Parameter to pull from the dataframe. 
+            :param frequency_bound: Frequency limits to take HDF group data between. 
+            :param index_group: The baseline data group whose indexing scheme should be used. 
+                                If None, defaults to the 'data' group in the same parent directory.
+            """
+            # Ensure consistent absolute pathing
+            group = '/' + group.strip('/')
+            
+            if index_group is None:
+                # If no index_group provided, guess the corresponding data group. 
+                # e.g., '/base/meta' -> '/base/data'
+                parent_path = group.rsplit('/', 1)[0]
+                index_group = f"{parent_path}/data"
+            else:
+                index_group = '/' + index_group.strip('/')
+                
+            rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(index_group)
+            ind = start_inds[index]
+            
+            try:
+                iter(ind)
+            except TypeError:
+                rg, rgi = rg_arr[ind], rgi_arr[ind] 
+                where_str = f'RecordGroup == "{rg}" & RecordGroupInd == "{rgi}"'
+            else:
+                rg, rgi = rg_arr[ind], rgi_arr[ind] 
+                rgmin, rgmax = rg.min(), rg.max()
+                rgimin, rgimax = rgi.min(), rgi.max()
+                where_str = ' & '.join([
+                        f'RecordGroup >= "{rgmin}" & RecordGroup <= "{rgmax}"',
+                        f'RecordGroupInd >= "{rgimin}" & RecordGroupInd <= "{rgimax}"'
+                    ])
                     
-                    if plot:
-                        axs['iq_process'].scatter(I, Q, color=color, marker='.') 
-                        axs['iq_process'].scatter(Icentered, Qcentered, color=color, marker='.') 
-                        axs['iq_process'].plot([xc, np.real(offres)], [yc, np.imag(offres)], color='black', marker='o')
-                        axs['centered_phase'].plot(plot_freqs, centered_phase, color=color)
-                        phase_fit = self._centered_phase_func(freqs, theta0, Ql, fr)
-                        axs['centered_phase'].plot(plot_freqs, phase_fit, ls=':', color='black')
+            df = self.select(group, where=where_str)
+            
+            if frequency_bound is not None and 'frequency' in df.columns:
+                freqs = df.frequency.values 
+                inds_bound = (frequency_bound[0] < freqs) * (freqs < frequency_bound[1])
+                df = df.iloc[inds_bound]
+                
+            if param is not None:
+                ret = df[param].values
+            else:
+                ret = df
 
-                # - remove environmental scaling from the data, write to store in a new group 'cal_data' - #
-                a_cal = afit if a is None else a
-                alpha_cal = alphafit if alpha is None else alpha
-                factor = a_cal*np.exp(1j*alpha_cal)
-                sdata /= factor
-                cal_I, cal_Q = np.real(sdata), np.imag(sdata) 
+            return ret
+    
+    def _get_index_arrays(self, data_group):
+        """ Read and cache the index structures for any data group in the hierarchy. 
+        
+        :param data_group: String corresponding to the hierarchical path of the data group.
+        """
+        if not data_group.startswith('/'):
+            data_group = '/' + data_group
+            
+        if data_group not in self._index_cache:
+            storer = self.get_storer(data_group)
+            rg = storer.read_column('RecordGroup')
+            rgi = storer.read_column('RecordGroupInd')
+            rr = storer.read_column('RecordRow')
+            
+            record_start_inds = np.where(rr == '000000')[0]
+            self._index_cache[data_group] = (rg, rgi, rr, record_start_inds)
+            
+        return self._index_cache[data_group]
 
-                if plot:
-                    axs['iq_final'].scatter(cal_I, cal_Q, marker='.', color=color)
+    # - GENERAL PROCESSING FUNCTIONS ------------------------------------------------------------------ #
+    def average_traces_on_sweep(self, in_group, out_group, sweep_param):
+        """ Average traces based on unique values of a given sweep parameter.
+        
+        :param in_group: The input group path from which to pull data (e.g., 'base').
+        :param out_group: The output group path to write the averaged traces into (e.g., 'process_0'). 
+                          Supports overwriting if in_group == out_group.
+        :param sweep_param: String formatted as 'subgroup.column' to map uniqueness over 
+                            (e.g., 'meta.power').
+        """
+        # Ensure paths have a consistent absolute format (e.g. '/base')
+        in_group = '/' + in_group.strip('/')
+        out_group = '/' + out_group.strip('/')
+        
+        subgroup, param = sweep_param.split('.')
+        sweep_path = f"{in_group}/{subgroup}"
+        
+        # Load the sweep parameter dataframe
+        sweep_df = self.select(sweep_path)
+        unique_vals = pd.unique(sweep_df[param])
+        
+        # Identify and load all metadata-like groups (everything under in_group except data)
+        # This dynamically captures /meta, /proc_params, or anything else alongside /data
+        keys = self.keys()
+        meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
+        meta_dfs = {k: self.select(k) for k in meta_keys}
+        
+        data_group = f"{in_group}/data"
+        tmp_out_prefix = '/tmp_avg_process'
+        
+        # Clear any leftover tmp groups from a previously crashed run
+        for k in keys:
+            if k.startswith(tmp_out_prefix):
+                self.remove(k)
+                
+        for i, val in enumerate(unique_vals):
+            matching_sweep_df = sweep_df[sweep_df[param] == val]
+            
+            I_list, Q_list = [], []
+            freqs = None
+            
+            # Retrieve traces for this sweep value
+            for idx in matching_sweep_df.index:
+                rg_val, rgi_val = idx[0], idx[1]
+                where_str = f'RecordGroup == "{rg_val}" & RecordGroupInd == "{rgi_val}"'
+                trace_df = self.select(data_group, where=where_str)
+                
+                if len(trace_df) == 0:
+                    continue
+                    
+                if freqs is None:
+                    freqs = trace_df['frequency'].values
+                I_list.append(trace_df['I'].values)
+                Q_list.append(trace_df['Q'].values)
+                
+            if not I_list:
+                continue
+                
+            N = len(I_list)
+            I_avg = np.mean(I_list, axis=0)
+            Q_avg = np.mean(Q_list, axis=0)
+            
+            # Calculate standard error of the mean (SEM)
+            if N > 1:
+                I_err = np.std(I_list, axis=0, ddof=1) / np.sqrt(N)
+                Q_err = np.std(Q_list, axis=0, ddof=1) / np.sqrt(N)
+            else:
+                # If only one trace exists, standard error is zero
+                I_err = np.zeros_like(I_avg)
+                Q_err = np.zeros_like(Q_avg)
+                
+            new_rg, new_rgi = '000000', '%06i' % i
+            
+            # Write Averaged Data to temporary group
+            data_index = pd.MultiIndex.from_product(
+                [[new_rg], [new_rgi], ['%06i' % j for j in range(len(freqs))]],
+                names=['RecordGroup', 'RecordGroupInd', 'RecordRow']
+            )
+            
+            avg_df = pd.DataFrame({
+                'frequency': freqs, 
+                'I': I_avg, 
+                'Q': Q_avg,
+                'I_err': I_err,
+                'Q_err': Q_err
+            }, index=data_index)
+            self.append(f"{tmp_out_prefix}/data", avg_df)
+            
+            # Write Processed Metadata and Proc Params to temporary groups
+            meta_index = pd.MultiIndex.from_product(
+                [[new_rg], [new_rgi]],
+                names=['RecordGroup', 'RecordGroupInd']
+            )
+            
+            first_idx = matching_sweep_df.index[0]
+            
+            for m_key, m_df in meta_dfs.items():
+                if first_idx in m_df.index:
+                    new_row = m_df.loc[[first_idx]].copy()
+                    new_row.index = meta_index
+                    
+                    # Ensure the sweep param explicitly reflects this value
+                    if m_key == sweep_path:
+                        new_row[param] = val
+                        
+                    sub_name = m_key.split('/')[-1]
+                    self.append(f"{tmp_out_prefix}/{sub_name}", new_row)
+                    
+        # Replace out_group with the newly generated temporary groups
+        # We delete the destination keys first to cleanly support 'in_group == out_group' overwriting
+        out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
+        for k in out_keys:
+            self.remove(k)
+            
+        # Move temporary groups into the final out_group
+        tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
+        for k in tmp_keys:
+            sub_name = k.split('/')[-1]
+            df = self.select(k)
+            self.append(f"{out_group}/{sub_name}", df)
+            self.remove(k)
+            
+        # Cache the index for the newly generated output data group
+        self._get_index_arrays(f"{out_group}/data")
 
-                # - write to store - #
-                cal_df = pd.DataFrame({
-                    'frequency': freqs, 
-                    'I': cal_I,
-                    'Q': cal_Q,
-                }, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi], ['%06i' % j for j in np.arange(freqs.shape[0])]],
-                    names=['RecordGroup', 'RecordGroupInd', 'RecordRow'] 
-                    )
-                )
-                self.append('temp_data', cal_df) 
-                cal_params_df = pd.DataFrame({
-                    'a': a_cal,
-                    'alpha': alpha_cal,
-                }, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi]],
-                    names=['RecordGroup', 'RecordGroupInd'],
-                    )
-                )
-                self.append('temp_params', cal_params_df)
-                j += 1
+    def average_res_params_on_sweep(self, in_group, sweep_param):
+        """ Average the fitted resonator parameters based on unique values of a given sweep parameter.
+        
+        :param in_group: The input group path from which to pull data (e.g., 'base').
+        :param sweep_param: String formatted as 'subgroup.column' to map uniqueness over.
+        """
+        in_group = '/' + in_group.strip('/')
+        params_group = f"{in_group}/res_params"
+        
+        if params_group not in self.keys():
+            raise KeyError(f"No res_params found at {params_group}. Please run fit_res_params first.")
+            
+        subgroup, param = sweep_param.split('.')
+        sweep_path = f"{in_group}/{subgroup}"
+        
+        sweep_df = self.select(sweep_path)
+        res_df = self.select(params_group)
+        
+        unique_vals = pd.unique(sweep_df[param])
+        
+        avg_records = []
+        index_tuples = []
+        
+        for val in unique_vals:
+            # Find matching indices in the sweep metadata
+            matching_indices = sweep_df[sweep_df[param] == val].index
+            
+            # Intersect with the indices that actually have fitted parameters
+            valid_indices = matching_indices.intersection(res_df.index)
+            
+            if len(valid_indices) == 0:
+                continue
+                
+            subset_df = res_df.loc[valid_indices]
+            N = len(subset_df)
+            
+            row = {}
+            
+            # - Average resonator parameters and propagate errors - #
+            # Identify base parameters (e.g., Ql, fr) and exclude the '_err' columns from the main loop
+            base_cols = [c for c in subset_df.columns if not c.endswith('_err')]
+            
+            for col in base_cols:
+                vals = subset_df[col].values
+                row[col] = np.mean(vals)
+                
+                # 1. Statistical scatter (Standard Error of the Mean)
+                sem = np.std(vals, ddof=1) / np.sqrt(N) if N > 1 else 0.0
+                
+                # 2. Propagated fit error
+                err_col = f"{col}_err"
+                if err_col in subset_df.columns:
+                    fit_errs = subset_df[err_col].values
+                    # The propagated error of an unweighted mean is sqrt(sum(err^2)) / N
+                    prop_err = np.sqrt(np.sum(fit_errs**2)) / N
+                    
+                    # Combine statistical scatter and propagated measurement error in quadrature
+                    row[err_col] = np.sqrt(sem**2 + prop_err**2)
+                else:
+                    row[err_col] = sem
+            
+            # - Average the sweep parameter itself and propagate errors - #
+            sweep_vals = sweep_df.loc[valid_indices, param].values
+            row[param] = np.mean(sweep_vals)
+            
+            sweep_sem = np.std(sweep_vals, ddof=1) / np.sqrt(N) if N > 1 else 0.0
+            
+            sweep_err_col = f"{param}_err"
+            if sweep_err_col in sweep_df.columns:
+                sweep_fit_errs = sweep_df.loc[valid_indices, sweep_err_col].values
+                sweep_prop_err = np.sqrt(np.sum(sweep_fit_errs**2)) / N
+                row[sweep_err_col] = np.sqrt(sweep_sem**2 + sweep_prop_err**2)
+            else:
+                row[sweep_err_col] = sweep_sem
+                    
+            avg_records.append(row)
+            
+            # Inherit the exact MultiIndex of the FIRST trace in the subselection
+            index_tuples.append(valid_indices[0])
+            
+        if avg_records:
+            avg_res_df = pd.DataFrame(avg_records)
+            avg_res_df.index = pd.MultiIndex.from_tuples(index_tuples, names=['RecordGroup', 'RecordGroupInd'])
+            
+            # Safely overwrite if it already exists
+            out_path = f"{in_group}/avg_res_params"
+            if out_path in self.keys():
+                self.remove(out_path)
+                
+            self.append(out_path, avg_res_df)
 
-            if '/cal_data' in self.keys():
-                self.remove('/cal_data')
-            self.get_node('/temp_data')._f_rename('cal_data')
-
-            if '/constant_scaling_params' in self.keys():
-                self.remove('/constant_scaling_params')
-            self.get_node('/temp_params')._f_rename('constant_scaling_params')
-
-        except Exception as e:
-            # - clean up the temp data groups if the fit errored - # 
+    # - CALIBRATION FUNCTIONS -------------------------------------------------------------------------- #
+    def calibrate_cable_delay(self, 
+                in_group, out_group,
+                tau=None, offset=None, 
+                frequency_bound=None, fit_frequency_bound=None, inds=None, 
+                plot=False, sweep_param=None, sweep_cmap='viridis', sweep_label=None,
+            ):
+            """ Remove a line from the unwrapped phase data.
+            
+            :param in_group: The group path from which to pull data (e.g., 'base').
+            :param out_group: The output group path to write the calibrated data into (e.g., 'cal_cable').
+                            Supports overwriting if in_group == out_group.
+            :param tau: Fixed cable delay slope. If None a line will be fit to the unwrapped phase.
+            :param offset: Fixed cable delay offset.
+            :param frequency_bound: Frequency range over which calibration should be performed. 
+            :param fit_frequency_bound: Frequency range over which a line fit should be performed. 
+            :param inds: Indices over which to perform the calibration. 
+            :param plot: Boolean to indicate if a plot showing the calibration results should be generated. 
+            :param sweep_param: String to indicate a parameter that is swept over in the data.
+            :param sweep_cmap: Colormap to use to indicate the value of the swept parameter.
+            :param sweep_label: String label used to label the colorbar. 
+            """
+            # - Format paths - #
+            in_group = '/' + in_group.strip('/')
+            out_group = '/' + out_group.strip('/')
+            data_group = f"{in_group}/data"
+            tmp_out_prefix = '/tmp_cal_process'
+            
+            # - Clean any leftover temp groups from a previously crashed run - #
             keys = self.keys()
-            if '/temp_data' in keys: 
-                self.remove('/temp_data')
-            if '/temp_params' in keys: 
-                self.remove('/temp_params')
+            for k in keys:
+                if k.startswith(tmp_out_prefix):
+                    self.remove(k)
 
-            raise e
+            rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
 
-        return ret
+            # - apply indices ------------------------------------------------------------- # 
+            if inds is None:
+                inds = np.arange(start_inds.shape[0])
+
+            # - set up sweep parameter and plot ------------------------------------------- #
+            if sweep_param is None:
+                sweep_param_vals = np.arange(start_inds.shape[0])
+                param = 'iter' 
+            else:
+                subgroup, param = sweep_param.split('.') 
+                sweep_path = f"{in_group}/{subgroup}"
+                sweep_param_vals = self[sweep_path][param].values[inds]
+                
+            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max()
+            
+            if plot:
+                fig, axs = self._configure_subplot_mosaic(
+                    [['phase_raw', 'iq_raw'], ['phase_cal', 'iq_cal']],
+                    sweep_param_vals,
+                    width_ratios=[0.475, 0.475, 0.05],
+                    sweep_label=sweep_label,
+                    sweep_cmap=sweep_cmap,
+                )
+                axs['phase_cal'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel)
+                axs['phase_raw'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel)
+                axs['iq_cal'].set(ylabel='Q', xlabel='I')
+                axs['iq_raw'].set(ylabel='Q', xlabel='I')
+                ret = fig, axs
+            else:
+                ret = None
+
+            try: 
+                # - Copy over non-data metadata (meta, proc_params, etc.) in bulk for speed - #
+                target_indices = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
+                meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
+                for m_key in meta_keys:
+                    m_df = self.select(m_key)
+                    # Filter to only the indices we are actually calibrating
+                    subset_df = m_df.loc[m_df.index.isin(target_indices)]
+                    sub_name = m_key.split('/')[-1]
+                    self.put(f"{tmp_out_prefix}/{sub_name}", subset_df, format='table')
+                
+                # - Process and calibrate data iteratively ------------------------------------ # 
+                for i, val in zip(inds, sweep_param_vals): 
+                    ind = start_inds[i] 
+                    rg_val, rgi_val = rg_arr[ind], rgi_arr[ind] 
+
+                    # Fetch raw trace
+                    data = self._get_group_values(data_group, i, frequency_bound=frequency_bound) 
+                    freqs = data.frequency.values  
+                    I, Q = data.I.values, data.Q.values
+                    phase = np.unwrap(np.arctan2(Q, I))
+                    mlin = np.sqrt(I**2 + Q**2)
+                    
+                    # Apply fitting bounds if provided
+                    if fit_frequency_bound is not None:
+                        fit_inds_arr = (fit_frequency_bound[0] < freqs) * (freqs < fit_frequency_bound[1])
+                        fit_freqs = freqs[fit_inds_arr]
+                        fit_phase = phase[fit_inds_arr]
+                    else:
+                        fit_freqs = freqs
+                        fit_phase = phase
+                        
+                    # Fit cable delay parameters
+                    if (tau is None) and (offset is None):
+                        fit_func = self._line_func
+                        popt, pcov = spopt.curve_fit(fit_func, fit_freqs, fit_phase)
+                        tau_fit, offset_fit = popt
+                    elif (tau is None) and (offset is not None):
+                        fit_func = lambda f, t: self._line_func(f, t, offset)
+                        popt, pcov = spopt.curve_fit(fit_func, fit_freqs, fit_phase)
+                        tau_fit = popt[0]
+                        offset_fit = offset 
+                    elif (tau is not None) and (offset is None):
+                        fit_func = lambda f, off: self._line_func(f, tau, off)
+                        popt, pcov = spopt.curve_fit(fit_func, fit_freqs, fit_phase)
+                        tau_fit = tau 
+                        offset_fit = popt[0] 
+                    else:
+                        tau_fit = tau
+                        offset_fit = offset 
+                        
+                    # Apply calibration
+                    line = self._line_func(freqs, tau_fit, offset_fit)
+                    corrected_phase = phase - line
+                    Ical, Qcal = mlin*np.cos(corrected_phase), mlin*np.sin(corrected_phase)
+                    
+                    # Write calibrated data to temporary store
+                    cal_df = pd.DataFrame(
+                        {'frequency': freqs, 'I': Ical, 'Q': Qcal}, 
+                        index=pd.MultiIndex.from_product(
+                            [[rg_val], [rgi_val], ['%06i' % j for j in np.arange(freqs.shape[0])]],
+                            names=['RecordGroup', 'RecordGroupInd', 'RecordRow'] 
+                        )
+                    )
+                    self.append(f"{tmp_out_prefix}/data", cal_df) 
+                    
+                    # Write fitted parameters to temporary store
+                    params_df = pd.DataFrame(
+                        {'tau': tau_fit, 'cable_delay_offset': offset_fit}, 
+                        index=pd.MultiIndex.from_product(
+                            [[rg_val], [rgi_val]], names=['RecordGroup', 'RecordGroupInd']
+                        )
+                    ) 
+                    self.append(f"{tmp_out_prefix}/cable_delay_params", params_df) 
+                    
+                    # - Plotting - #
+                    if plot:
+                        plot_freqs = freqs*1e-9
+                        color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap) 
+                        axs['phase_raw'].plot(plot_freqs, phase, color=color)
+                        axs['phase_raw'].plot(plot_freqs, line, ls=':', color='black')
+                        axs['phase_cal'].plot(plot_freqs, corrected_phase, color=color)
+                        axs['iq_raw'].scatter(I, Q, color=color, marker='.')
+                        axs['iq_cal'].scatter(Ical, Qcal, color=color, marker='.')
+
+                # - Move temporary groups into the final out_group ---------------------------- #
+                # Remove destination keys if overwriting
+                out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
+                for k in out_keys:
+                    self.remove(k)
+                    
+                # Rename temp groups
+                tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
+                for k in tmp_keys:
+                    sub_name = k.split('/')[-1]
+                    df = self.select(k)
+                    self.append(f"{out_group}/{sub_name}", df)
+                    self.remove(k)
+                    
+                # Update index cache for the new data group
+                self._get_index_arrays(f"{out_group}/data")
+            
+            except Exception as e:
+                # - Clean up the temp data groups if the fit errored - # 
+                for k in self.keys():
+                    if k.startswith(tmp_out_prefix):
+                        self.remove(k)
+                raise e
+
+            return ret
+    
+    def calibrate_constant_scaling(self,
+                in_group, out_group,
+                a=None, alpha=None, phase_fit_kwargs=None,
+                inds=None, plot=False, frequency_bound=None,
+                sweep_param=None, sweep_cmap='viridis', sweep_label=None, 
+            ):
+            # - Format paths - #
+            in_group = '/' + in_group.strip('/')
+            out_group = '/' + out_group.strip('/')
+            data_group = f"{in_group}/data"
+            tmp_out_prefix = '/tmp_cal_process'
+            
+            keys = self.keys()
+            for k in keys:
+                if k.startswith(tmp_out_prefix):
+                    self.remove(k)
+
+            rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+
+            if inds is None:
+                inds = np.arange(start_inds.shape[0])
+                
+            if sweep_param is None:
+                sweep_param_vals = np.arange(start_inds.shape[0])
+                param = 'iter' 
+            else:
+                subgroup, param = sweep_param.split('.') 
+                sweep_path = f"{in_group}/{subgroup}"
+                sweep_param_vals = self[sweep_path][param].values[inds]
+                
+            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+
+            if plot:
+                fig, axs = self._configure_subplot_mosaic(
+                    [['iq_raw', 'iq_process'], ['centered_phase', 'iq_final']],
+                    sweep_param_vals=sweep_param_vals, width_ratios=[0.475, 0.475, 0.05],
+                    sweep_label=sweep_label, sweep_cmap=sweep_cmap,
+                )
+                for key, ax in axs.items():
+                    if 'iq' in key:
+                        ax.set(xlabel='I', ylabel='Q')
+                axs['centered_phase'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel) 
+                ret = fig, axs
+            else:
+                ret = None
+
+            try: 
+                # - Bulk copy metadata - #
+                target_indices = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
+                meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
+                for m_key in meta_keys:
+                    m_df = self.select(m_key)
+                    subset_df = m_df.loc[m_df.index.isin(target_indices)]
+                    sub_name = m_key.split('/')[-1]
+                    self.put(f"{tmp_out_prefix}/{sub_name}", subset_df, format='table')
+                    
+                j = 0 
+                for i, val in zip(inds, sweep_param_vals):
+                    ind = start_inds[i]
+                    rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
+                    fb = frequency_bound[j] if (frequency_bound is not None and len(frequency_bound) > 2) else frequency_bound
+                    
+                    data = self._get_group_values(data_group, i, frequency_bound=fb)
+                    I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
+                    mlin = np.sqrt(I**2 + Q**2) 
+                    phase = np.unwrap(np.arctan2(Q, I)) 
+                    sdata = mlin*np.exp(1j*phase)
+
+                    if plot:
+                        color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
+                        plot_freqs = freqs*1e-9 
+                        axs['iq_raw'].scatter(I, Q, marker='.', color=color)
+
+                    if (a is None) or (alpha is None): 
+                        xc, yc, r = circle_fit(sdata)
+                        Icentered = I - xc
+                        Qcentered = Q - yc
+                        centered_phase = np.unwrap(np.arctan2(Qcentered, Icentered))
+
+                        phase_fit_kwargs = {} if phase_fit_kwargs is None else phase_fit_kwargs 
+                        params, pcov = self._centered_phase_fit(freqs, centered_phase, **phase_fit_kwargs)
+                        theta0, Ql, fr = params
+
+                        beta = (theta0 + np.pi)
+                        offres = xc + r*np.cos(beta) + 1j*(yc + r*np.sin(beta))
+                        afit, alphafit = np.abs(offres), np.arctan2(np.imag(offres), np.real(offres))
+                        
+                        if plot:
+                            axs['iq_process'].scatter(I, Q, color=color, marker='.') 
+                            axs['iq_process'].scatter(Icentered, Qcentered, color=color, marker='.') 
+                            axs['iq_process'].plot([xc, np.real(offres)], [yc, np.imag(offres)], color='black', marker='o')
+                            axs['centered_phase'].plot(plot_freqs, centered_phase, color=color)
+                            phase_fit = self._centered_phase_func(freqs, theta0, Ql, fr)
+                            axs['centered_phase'].plot(plot_freqs, phase_fit, ls=':', color='black')
+
+                    a_cal = afit if a is None else a
+                    alpha_cal = alphafit if alpha is None else alpha
+                    factor = a_cal*np.exp(1j*alpha_cal)
+                    sdata /= factor
+                    cal_I, cal_Q = np.real(sdata), np.imag(sdata) 
+
+                    if plot:
+                        axs['iq_final'].scatter(cal_I, cal_Q, marker='.', color=color)
+
+                    cal_df = pd.DataFrame({'frequency': freqs, 'I': cal_I, 'Q': cal_Q},
+                        index=pd.MultiIndex.from_product(
+                        [[rg_val], [rgi_val], ['%06i' % j for j in np.arange(freqs.shape[0])]],
+                        names=['RecordGroup', 'RecordGroupInd', 'RecordRow'] 
+                    ))
+                    self.append(f"{tmp_out_prefix}/data", cal_df) 
+                    
+                    cal_params_df = pd.DataFrame({'a': a_cal, 'alpha': alpha_cal}, 
+                        index=pd.MultiIndex.from_product(
+                        [[rg_val], [rgi_val]], names=['RecordGroup', 'RecordGroupInd']
+                    ))
+                    self.append(f"{tmp_out_prefix}/constant_scaling_params", cal_params_df)
+                    j += 1
+
+                # - Move to final group - #
+                out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
+                for k in out_keys:
+                    self.remove(k)
+                    
+                tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
+                for k in tmp_keys:
+                    sub_name = k.split('/')[-1]
+                    df = self.select(k)
+                    self.append(f"{out_group}/{sub_name}", df)
+                    self.remove(k)
+                    
+                self._get_index_arrays(f"{out_group}/data")
+
+            except Exception as e:
+                for k in self.keys():
+                    if k.startswith(tmp_out_prefix): self.remove(k)
+                raise e
+            return ret
 
     def calibrate_polymag_background(self,
-            frequency_bound=None, lower_frequency_bound=None, upper_frequency_bound=None, 
-            inds=None, degree=2, fixed_coeffs=None, domain=None,
-            cal=False, plot=False, sweep_param=None, 
-            sweep_cmap='viridis', sweep_label=None, 
-        ):
-        """ Fit and remove a polynomial background from the magnitude data.
-        
-        :param frequency_bound: Global frequency limits for polynomial fitting. 
-        :param lower_frequency_bound: Lower frequency limits on fitting a polynomial to magnitude data.
-        :param upper_frequency_bound: Upper frequency limits for fitting a polynomial to magnitude data. 
-        :param inds: Record start indices to plot over. If None, all available data will be plotted.
-        :param degree: Degree of the polynomial to fit.
-        :param fixed_coeffs: List of polynomial coefficients to apply a fixed calibration. 
-        :param domain: Polynomial fit domain used to apply a fixed cablibration. 
-        :param cal: Boolean to indicate if existing cal_data should be used.
-        :param plot: Boolean to indicate if the calibration results should be plotted. 
-        :param sweep_param: String to indicate a swept parameter for a colorbar.
-        :param sweep_cmap: Colormap used to indicate the value of the swept parameter.
-        :param sweep_label: String label used to indicate the colorbar.
-        """
-        # - apply indices --------------- #
-        if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
-        if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
-        else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
-
-        if plot:
-            fig, axs = self._configure_subplot_mosaic(
-                [['mag_raw'], ['mag_cal']],
-                sweep_param_vals,
-                width_ratios=[0.9, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-            axs['mag_raw'].set(
-                xlabel='Frequency (GHz.)',
-                ylabel=self.mag_ylabel,
-            )
-            axs['mag_cal'].set(
-                xlabel='Frequency (GHz.)',
-                ylabel=self.mag_ylabel,
-            )
-            ret = fig, axs
-        else:
-            ret = None
-
-        # - apply background polynomial fitting and removal - #
-        try: 
-            for i, val in zip(inds, sweep_param_vals):
-                ind = self.record_start_inds[i]
-                rg, rgi = self.rg[ind], self.rgi[ind] 
-                if param != 'iter':
-                    sweep_val = self._get_group_values(group, i, param=param, frequency_bound=frequency_bound)
-                else:
-                    sweep_val = val 
-                data_group = 'data' if not cal else 'cal_data'
-                # - extract data to fit - # 
-                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
-                I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
-                mlog = (1 + 1*self.power)*10*np.log10(np.sqrt(I**2 + Q**2))
-                phase = np.unwrap(np.arctan2(Q, I)) 
-                if lower_frequency_bound is not None:
-                    lower_inds = np.where((lower_frequency_bound[0] <= freqs) * (freqs <= lower_frequency_bound[1]))[0] 
-                    lower_I, lower_Q, lower_freqs = I[lower_inds], Q[lower_inds], freqs[lower_inds]
-                    lower_mlog = (1 + 1*self.power)*10*np.log10(np.sqrt(lower_I**2 + lower_Q**2))
-                if upper_frequency_bound is not None:
-                    upper_inds = np.where((upper_frequency_bound[0] <= freqs) * (freqs <= upper_frequency_bound[1]))[0] 
-                    upper_I, upper_Q, upper_freqs = I[upper_inds], Q[upper_inds], freqs[upper_inds]
-                    upper_mlog = (1 + 1*self.power)*10*np.log10(np.sqrt(upper_I**2 + upper_Q**2))
-                if fixed_coeffs is None:
-                    if (upper_frequency_bound is None) and (lower_frequency_bound is not None):
-                        fit = Polynomial.fit(lower_freqs, lower_mlog, degree)
-                        fit = (lower_freqs, fit) 
-                    elif (upper_frequency_bound is not None) and (lower_frequency_bound is None):
-                        fit = Polynomial.fit(upper_freqs, upper_mlog, degree)
-                        fit = (upper_freqs, fit) 
-                    elif (upper_frequency_bound is not None) and (lower_frequency_bound is not None):
-                        fit = Polynomial.fit(np.concatenate([lower_freqs, upper_freqs]), np.concatenate([lower_mlog, upper_mlog]), degree) 
-                        fit = (freqs, fit) 
-                    else: # - (upper_frequency_bound is None) and (lower_frequency_bound is None)
-                        fit = (freqs, Polynomial.fit(freqs, mlog, degree))
-                elif domain is not None:
-                    fit = Polynomial(fixed_coeffs, domain=domain) 
-                    if (upper_frequency_bound is None) and (lower_frequency_bound is not None):
-                        fit = (lower_freqs, fit) 
-                    elif (upper_frequency_bound is not None) and (lower_frequency_bound is None):
-                        fit = (upper_freqs, fit) 
-                    else:
-                        fit = (freqs, fit) 
-                else:
-                    raise ValueError('domain must be provided for a fixed polynomial fit.')
-
-                # - remove the background - #
-                fit_mlog = np.zeros_like(freqs)
-                fit_mlog[(fit[0].min() <= freqs) * (freqs <= fit[0].max())] = fit[1](fit[0]) 
-                cal_mlog = mlog - fit_mlog
-                cal_mlin = 10**(cal_mlog / ((1 + 1*self.power)*10))
-                cal_I, cal_Q = cal_mlin*np.cos(phase), cal_mlin*np.sin(phase)
-
-                # - write to store - # 
-                cal_df = pd.DataFrame({
-                    'frequency': freqs, 
-                    'I': cal_I,
-                    'Q': cal_Q,
-                }, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi], ['%06i' % j for j in np.arange(freqs.shape[0])]],
-                    names=['RecordGroup', 'RecordGroupInd', 'RecordRow'] 
-                    )
-                )
-                self.append('temp_data', cal_df)
-                cal_params_dict = {
-                    'x%i' % j: fit[1].coef[j] 
-                    for j in range(fit[1].coef.shape[0])
-                } 
-                cal_params_dict['domain_min'] = fit[1].domain.min()
-                cal_params_dict['domain_max'] = fit[1].domain.max() 
-                cal_params_df = pd.DataFrame(cal_params_dict, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi]],
-                    names=['RecordGroup', 'RecordGroupInd'] 
-                    )
-                )
-                self.append('temp_params', cal_params_df)
-
-                # - plot - #
-                if plot:
-                    plot_freqs = freqs*1e-9 
-                    color = self._compute_color(sweep_val, sweep_min, sweep_max, sweep_cmap) 
-                    axs['mag_raw'].plot(plot_freqs, mlog, color=color)
-                    axs['mag_raw'].plot(plot_freqs, fit_mlog, ls=':', color='black') 
-                    axs['mag_cal'].plot(plot_freqs, cal_mlog, color=color)
-
-                if '/cal_data' in self.keys():
-                    self.remove('/cal_data') 
-                self.get_node('/temp_data')._f_rename('cal_data')
-
-                if '/polymag_params' in self.keys():
-                    self.remove('/polymag_params')
-                self.get_node('/temp_params')._f_rename('polymag_params')
-        
-        except Exception as e:
-            # - clean up the temp data groups if the fit errored - # 
+                in_group, out_group,
+                frequency_bound=None, lower_frequency_bound=None, upper_frequency_bound=None, 
+                inds=None, degree=2, fixed_coeffs=None, domain=None,
+                plot=False, sweep_param=None, sweep_cmap='viridis', sweep_label=None, 
+            ):
+            in_group = '/' + in_group.strip('/')
+            out_group = '/' + out_group.strip('/')
+            data_group = f"{in_group}/data"
+            tmp_out_prefix = '/tmp_cal_process'
+            
             keys = self.keys()
-            if '/temp_data' in keys: 
-                self.remove('/temp_data')
-            if '/temp_params' in keys: 
-                self.remove('/temp_params')
+            for k in keys:
+                if k.startswith(tmp_out_prefix): self.remove(k)
 
-            raise e
+            rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
 
-        return ret
+            if inds is None:
+                inds = np.arange(start_inds.shape[0])
+                
+            if sweep_param is None:
+                sweep_param_vals = np.arange(start_inds.shape[0])
+                param = 'iter' 
+            else:
+                subgroup, param = sweep_param.split('.') 
+                sweep_path = f"{in_group}/{subgroup}"
+                sweep_param_vals = self[sweep_path][param].values[inds]
+                
+            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+
+            if plot:
+                fig, axs = self._configure_subplot_mosaic(
+                    [['mag_raw'], ['mag_cal']], sweep_param_vals, width_ratios=[0.95, 0.05],
+                    sweep_label=sweep_label, sweep_cmap=sweep_cmap,
+                )
+                axs['mag_raw'].set(xlabel='Frequency (GHz)', ylabel=self.mag_ylabel)
+                axs['mag_cal'].set(xlabel='Frequency (GHz)', ylabel=self.mag_ylabel)
+                ret = fig, axs
+            else:
+                ret = None
+
+            try: 
+                target_indices = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
+                meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
+                for m_key in meta_keys:
+                    m_df = self.select(m_key)
+                    subset_df = m_df.loc[m_df.index.isin(target_indices)]
+                    sub_name = m_key.split('/')[-1]
+                    self.put(f"{tmp_out_prefix}/{sub_name}", subset_df, format='table')
+
+                for i, val in zip(inds, sweep_param_vals):
+                    ind = start_inds[i]
+                    rg_val, rgi_val = rg_arr[ind], rgi_arr[ind] 
+                    
+                    data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+                    I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
+                    mlog = (1 + 1*self.power)*10*np.log10(np.sqrt(I**2 + Q**2))
+                    phase = np.unwrap(np.arctan2(Q, I)) 
+                    
+                    if lower_frequency_bound is not None:
+                        lower_inds = np.where((lower_frequency_bound[0] <= freqs) * (freqs <= lower_frequency_bound[1]))[0] 
+                        lower_I, lower_Q, lower_freqs = I[lower_inds], Q[lower_inds], freqs[lower_inds]
+                        lower_mlog = (1 + 1*self.power)*10*np.log10(np.sqrt(lower_I**2 + lower_Q**2))
+                    if upper_frequency_bound is not None:
+                        upper_inds = np.where((upper_frequency_bound[0] <= freqs) * (freqs <= upper_frequency_bound[1]))[0] 
+                        upper_I, upper_Q, upper_freqs = I[upper_inds], Q[upper_inds], freqs[upper_inds]
+                        upper_mlog = (1 + 1*self.power)*10*np.log10(np.sqrt(upper_I**2 + upper_Q**2))
+                        
+                    if fixed_coeffs is None:
+                        if (upper_frequency_bound is None) and (lower_frequency_bound is not None):
+                            fit = Polynomial.fit(lower_freqs, lower_mlog, degree)
+                            fit = (lower_freqs, fit) 
+                        elif (upper_frequency_bound is not None) and (lower_frequency_bound is None):
+                            fit = Polynomial.fit(upper_freqs, upper_mlog, degree)
+                            fit = (upper_freqs, fit) 
+                        elif (upper_frequency_bound is not None) and (lower_frequency_bound is not None):
+                            fit = Polynomial.fit(np.concatenate([lower_freqs, upper_freqs]), np.concatenate([lower_mlog, upper_mlog]), degree) 
+                            fit = (freqs, fit) 
+                        else: 
+                            fit = (freqs, Polynomial.fit(freqs, mlog, degree))
+                    elif domain is not None:
+                        fit = Polynomial(fixed_coeffs, domain=domain) 
+                        if (upper_frequency_bound is None) and (lower_frequency_bound is not None):
+                            fit = (lower_freqs, fit) 
+                        elif (upper_frequency_bound is not None) and (lower_frequency_bound is None):
+                            fit = (upper_freqs, fit) 
+                        else:
+                            fit = (freqs, fit) 
+                    else:
+                        raise ValueError('domain must be provided for a fixed polynomial fit.')
+
+                    fit_mlog = np.zeros_like(freqs)
+                    fit_mlog[(fit[0].min() <= freqs) * (freqs <= fit[0].max())] = fit[1](fit[0]) 
+                    cal_mlog = mlog - fit_mlog
+                    cal_mlin = 10**(cal_mlog / ((1 + 1*self.power)*10))
+                    cal_I, cal_Q = cal_mlin*np.cos(phase), cal_mlin*np.sin(phase)
+
+                    cal_df = pd.DataFrame({'frequency': freqs, 'I': cal_I, 'Q': cal_Q},
+                        index=pd.MultiIndex.from_product(
+                        [[rg_val], [rgi_val], ['%06i' % j for j in np.arange(freqs.shape[0])]],
+                        names=['RecordGroup', 'RecordGroupInd', 'RecordRow'] 
+                    ))
+                    self.append(f"{tmp_out_prefix}/data", cal_df)
+                    
+                    cal_params_dict = {f'x{j}': fit[1].coef[j] for j in range(fit[1].coef.shape[0])} 
+                    cal_params_dict['domain_min'] = fit[1].domain.min()
+                    cal_params_dict['domain_max'] = fit[1].domain.max() 
+                    cal_params_df = pd.DataFrame(cal_params_dict, index=pd.MultiIndex.from_product(
+                        [[rg_val], [rgi_val]], names=['RecordGroup', 'RecordGroupInd'] 
+                    ))
+                    self.append(f"{tmp_out_prefix}/polymag_params", cal_params_df)
+
+                    if plot:
+                        plot_freqs = freqs*1e-9 
+                        color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap) 
+                        axs['mag_raw'].plot(plot_freqs, mlog, color=color)
+                        axs['mag_raw'].plot(plot_freqs, fit_mlog, ls=':', color='black') 
+                        axs['mag_cal'].plot(plot_freqs, cal_mlog, color=color)
+
+                out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
+                for k in out_keys: self.remove(k)
+                    
+                tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
+                for k in tmp_keys:
+                    sub_name = k.split('/')[-1]
+                    df = self.select(k)
+                    self.append(f"{out_group}/{sub_name}", df)
+                    self.remove(k)
+                    
+                self._get_index_arrays(f"{out_group}/data")
+            
+            except Exception as e:
+                for k in self.keys():
+                    if k.startswith(tmp_out_prefix): self.remove(k)
+                raise e
+            return ret
 
     def calibrate_polyphase_background(self,
+            in_group, out_group,
             frequency_bound=None, lower_frequency_bound=None, upper_frequency_bound=None,
-            inds=None, degree=2, fixed_coeffs=None, domain=None, cal=False, plot=False, 
+            inds=None, degree=2, fixed_coeffs=None, domain=None, plot=False, 
             sweep_param=None, sweep_cmap='viridis', sweep_label=None,
         ):
-        """ Fit and remove a polynomial background from the phase data.
+        in_group = '/' + in_group.strip('/')
+        out_group = '/' + out_group.strip('/')
+        data_group = f"{in_group}/data"
+        tmp_out_prefix = '/tmp_cal_process'
         
-        :param frequency_bound: Global frequency limits for polynomial fitting. 
-        :param lower_frequency_bound: Lower frequency limits on fitting a polynomial to phase data.
-        :param upper_frequency_bound: Upper frequency limits for fitting a polynomial to phase data. 
-        :param inds: Record start indices to plot over. If None, all available data will be plotted.
-        :param degree: Degree of the polynomial to fit.
-        :param fixed_coeffs: List of polynomial coefficients to apply a fixed calibration. 
-        :param sep: Boolean to indicate if the polynomial fit should be connected across the the lower and
-        upper frequency bounds.
-        :param cal: Boolean to indicate if existing cal_data should be used.
-        :param plot: Boolean to indicate if the calibration results should be plotted. 
-        :param sweep_param: String to indicate a swept parameter for a colorbar.
-        :param sweep_cmap: Colormap used to indicate the value of the swept parameter.
-        :param sweep_label: String label used to indicate the colorbar.
-        """
-        # - apply indices --------------- #
+        keys = self.keys()
+        for k in keys:
+            if k.startswith(tmp_out_prefix): self.remove(k)
+
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+
         if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
+            inds = np.arange(start_inds.shape[0])
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
+            sweep_param_vals = np.arange(start_inds.shape[0])
+            param = 'iter' 
         else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
+            subgroup, param = sweep_param.split('.') 
+            sweep_path = f"{in_group}/{subgroup}"
+            sweep_param_vals = self[sweep_path][param].values[inds]
+            
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         if plot:
             fig, axs = self._configure_subplot_mosaic(
-                [['phase_raw'], ['phase_cal']],
-                sweep_param_vals,
-                width_ratios=[0.9, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
+                [['phase_raw'], ['phase_cal']], sweep_param_vals, width_ratios=[0.95, 0.05],
+                sweep_label=sweep_label, sweep_cmap=sweep_cmap,
             )
-            axs['phase_raw'].set(
-                xlabel='Frequency (GHz.)',
-                ylabel=self.phase_ylabel,
-            )
-            axs['phase_cal'].set(
-                xlabel='Frequency (GHz.)',
-                ylabel=self.phase_ylabel,
-            )
+            axs['phase_raw'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel)
+            axs['phase_cal'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel)
             ret = fig, axs
         else:
             ret = None
 
-        # - apply background polynomial fitting and removal - #
         try: 
+            target_indices = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
+            meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
+            for m_key in meta_keys:
+                m_df = self.select(m_key)
+                subset_df = m_df.loc[m_df.index.isin(target_indices)]
+                sub_name = m_key.split('/')[-1]
+                self.put(f"{tmp_out_prefix}/{sub_name}", subset_df, format='table')
+
             for i, val in zip(inds, sweep_param_vals):
-                ind = self.record_start_inds[i]
-                rg, rgi = self.rg[ind], self.rgi[ind] 
-                if param != 'iter':
-                    sweep_val = self._get_group_values(group, i, param=param, frequency_bound=frequency_bound)
-                else:
-                    sweep_val = val 
-                data_group = 'data' if not cal else 'cal_data'
-                # - extract data to fit - # 
+                ind = start_inds[i]
+                rg_val, rgi_val = rg_arr[ind], rgi_arr[ind] 
+                
                 data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
                 I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
                 mlin = np.sqrt(I**2 + Q**2) 
                 phase = np.unwrap(np.arctan2(Q, I)) 
+                
                 if lower_frequency_bound is not None:
                     lower_inds = np.where((lower_frequency_bound[0] <= freqs) * (freqs <= lower_frequency_bound[1]))[0] 
                     lower_freqs = freqs[lower_inds] 
@@ -675,6 +959,7 @@ class ResonatorScatteringStore(pd.HDFStore):
                     upper_inds = np.where((upper_frequency_bound[0] <= freqs) * (freqs <= upper_frequency_bound[1]))[0] 
                     upper_freqs = freqs[upper_inds] 
                     upper_phase = phase[upper_inds] 
+                    
                 if fixed_coeffs is None: 
                     if (upper_frequency_bound is None) and (lower_frequency_bound is not None):
                         fit = Polynomial.fit(lower_freqs, lower_phase, degree)
@@ -685,7 +970,7 @@ class ResonatorScatteringStore(pd.HDFStore):
                     elif (upper_frequency_bound is not None) and (lower_frequency_bound is not None):
                         fit = Polynomial.fit(np.concatenate([lower_freqs, upper_freqs]), np.concatenate([lower_phase, upper_phase]), degree) 
                         fit = (freqs, fit) 
-                    else: # - (upper_frequency_bound is None) and (lower_frequency_bound is None)
+                    else:
                         fit = (freqs, Polynomial.fit(freqs, phase, degree))
                 elif domain is not None:
                     fit = Polynomial(fixed_coeffs, domain=domain) 
@@ -698,159 +983,148 @@ class ResonatorScatteringStore(pd.HDFStore):
                 else:
                     raise ValueError('domain must be provided for a fixed polynomial fit.')
 
-                # - remove the background - #
                 fit_phase = np.zeros_like(freqs)
                 fit_phase[(fit[0].min() <= freqs) * (freqs <= fit[0].max())] = fit[1](fit[0])
                 cal_phase = phase - fit_phase
                 cal_I, cal_Q = mlin*np.cos(cal_phase), mlin*np.sin(cal_phase)
 
-                # - write to store - # 
-                cal_df = pd.DataFrame({
-                    'frequency': freqs, 
-                    'I': cal_I,
-                    'Q': cal_Q,
-                }, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi], ['%06i' % j for j in np.arange(freqs.shape[0])]],
+                cal_df = pd.DataFrame({'frequency': freqs, 'I': cal_I, 'Q': cal_Q},
+                    index=pd.MultiIndex.from_product(
+                    [[rg_val], [rgi_val], ['%06i' % j for j in np.arange(freqs.shape[0])]],
                     names=['RecordGroup', 'RecordGroupInd', 'RecordRow'] 
-                    )
-                )
-                self.append('temp_data', cal_df)
-                cal_params_dict = {
-                    'x%i' % j: fit[1].coef[j]
-                    for j in range(fit[1].coef.shape[0])
-                } 
+                ))
+                self.append(f"{tmp_out_prefix}/data", cal_df)
+                
+                cal_params_dict = {f'x{j}': fit[1].coef[j] for j in range(fit[1].coef.shape[0])} 
                 cal_params_dict['domain_min'] = fit[1].domain.min()
                 cal_params_dict['domain_max'] = fit[1].domain.max() 
                 cal_params_df = pd.DataFrame(cal_params_dict, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi]],
-                    names=['RecordGroup', 'RecordGroupInd'] 
-                    )
-                )
-                self.append('temp_params', cal_params_df)
+                    [[rg_val], [rgi_val]], names=['RecordGroup', 'RecordGroupInd'] 
+                ))
+                self.append(f"{tmp_out_prefix}/polyphase_params", cal_params_df)
 
-                # - plot - #
                 if plot:
-                    color = self._compute_color(sweep_val, sweep_min, sweep_max, sweep_cmap) 
+                    color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap) 
                     axs['phase_raw'].plot(freqs, phase, color=color)
                     axs['phase_raw'].plot(freqs, fit_phase, ls=':', color='black') 
                     axs['phase_cal'].plot(freqs, cal_phase, color=color)
 
-                if '/cal_data' in self.keys():
-                    self.remove('/cal_data') 
-                self.get_node('/temp_data')._f_rename('cal_data')
-
-                if '/polyphase_params' in self.keys():
-                    self.remove('/polyphase_params')
-                self.get_node('/temp_params')._f_rename('polyphase_params')
+            out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
+            for k in out_keys: self.remove(k)
+                
+            tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
+            for k in tmp_keys:
+                sub_name = k.split('/')[-1]
+                df = self.select(k)
+                self.append(f"{out_group}/{sub_name}", df)
+                self.remove(k)
+                
+            self._get_index_arrays(f"{out_group}/data")
 
         except Exception as e:
-            # - clean up the temp data groups if the fit errored - # 
-            keys = self.keys()
-            if '/temp_data' in keys: 
-                self.remove('/temp_data')
-            if '/temp_params' in keys: 
-                self.remove('/temp_params')
-
+            for k in self.keys():
+                if k.startswith(tmp_out_prefix): self.remove(k)
             raise e
-
         return ret
 
-    def calibrate_from_file(self, filepath,
-            frequency_bound=None, inds=None, plot=False,
+    def calibrate_from_file(self, filepath, in_group, out_group,
+            bg_group='/base/data', frequency_bound=None, inds=None, plot=False,
             sweep_param=None, sweep_cmap='viridis', sweep_label=None, 
         ):
-        """ Perform background calibration using a measured data file.
+        in_group = '/' + in_group.strip('/')
+        out_group = '/' + out_group.strip('/')
+        data_group = f"{in_group}/data"
+        tmp_out_prefix = '/tmp_cal_process'
+        
+        bg_group = '/' + bg_group.strip('/')
+        
+        keys = self.keys()
+        for k in keys:
+            if k.startswith(tmp_out_prefix): self.remove(k)
+            
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
 
-        :param filepath: String filepath to where the background datafile is stored. 
-        :param frequency_bound: Limited frequency range over which to perform the calibration.
-        :param inds: Record start indices to calibrate.
-        :param plot: Boolean to indicate if calibration results should be plotted.
-        :param sweep_param: String to indicate a swept parameter for a colorbar.
-        :param sweep_cmap: Colormap used to indicate the value of the swept parameter.
-        :param sweep_label: String label used to indicate the colorbar.
-        """ 
         # - open background calibration data - # 
-        bg_store = pd.HDFStore(filepath) 
-        bg_data = bg_store.data
+        with pd.HDFStore(filepath, mode='r') as bg_store:
+            bg_data = bg_store.select(bg_group)
+            
         bg_I, bg_Q, bg_freqs = bg_data.I.values, bg_data.Q.values, bg_data.frequency.values 
         if frequency_bound is not None:
             bg_inds = np.where((frequency_bound[0] <= bg_freqs) * (bg_freqs <= frequency_bound[1]))[0] 
             bg_I, bg_Q, bg_freqs = bg_I[bg_inds], bg_Q[bg_inds], bg_freqs[bg_inds] 
+            
         bg_mlin = np.sqrt(bg_I**2 + bg_Q**2) 
         bg_mlog = (1 + 1*self.power)*10*np.log10(bg_mlin) 
         bg_phase = np.unwrap(np.arctan2(bg_Q, bg_I))
 
-        # - apply indices - #
         if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
+            inds = np.arange(start_inds.shape[0])
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
+            sweep_param_vals = np.arange(start_inds.shape[0])
+            param = 'iter' 
         else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
+            subgroup, param = sweep_param.split('.') 
+            sweep_path = f"{in_group}/{subgroup}"
+            sweep_param_vals = self[sweep_path][param].values[inds]
+            
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         if plot:
             fig, axs = self._configure_subplot_mosaic(
                 [['raw_mag', 'cal_mag'], ['raw_phase', 'cal_phase']],
-                width_ratios=[0.45, 0.45, 0.1],
-                sweep_cmap=sweep_cmap,
-                sweep_label=sweep_label,
-                sweep_param_vals=sweep_param_vals,
+                width_ratios=[0.475, 0.475, 0.05], sweep_cmap=sweep_cmap,
+                sweep_label=sweep_label, sweep_param_vals=sweep_param_vals,
             )
             for key, ax in axs.items():
-                ax.set_xlabel('Frequency (GHz.)')
-                if 'mag' in key:
-                    ax.set_ylabel(self.mag_ylabel)
-                else:
-                    ax.set_ylabel(self.phase_ylabel)
+                ax.set_xlabel('Frequency (GHz)')
+                if 'mag' in key: ax.set_ylabel(self.mag_ylabel)
+                else: ax.set_ylabel(self.phase_ylabel)
             ret = fig, axs
         else:
             ret = None
 
         try: 
+            target_indices = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
+            meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
+            for m_key in meta_keys:
+                m_df = self.select(m_key)
+                subset_df = m_df.loc[m_df.index.isin(target_indices)]
+                sub_name = m_key.split('/')[-1]
+                self.put(f"{tmp_out_prefix}/{sub_name}", subset_df, format='table')
+
             background_plotted = False 
             for i, val in zip(inds, sweep_param_vals):
-                ind = self.record_start_inds[i]
-                rg, rgi = self.rg[ind], self.rgi[ind]
-                if param != 'iter':
-                    sweep_val = self._get_group_values(group, i, param=param, frequency_bound=frequency_bound)
-                else:
-                    sweep_val = val
-                data = self._get_group_values('data', i, frequency_bound=frequency_bound)
+                ind = start_inds[i]
+                rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
+                
+                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
                 I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
                 mlin = np.sqrt(I**2 + Q**2)
                 mlog = (1 + 1*self.power)*10*np.log10(mlin) 
                 phase = np.unwrap(np.arctan2(Q, I))
                 sdata = mlin*np.exp(1j*phase)
                 
-                # - interpolate the calibration data to the same frequency values as the measurement data - # 
                 bg_mlin_interp = np.interp(freqs, bg_freqs, bg_mlin) 
                 bg_mlog_interp = (1 + 1*self.power)*10*np.log10(bg_mlin_interp) 
                 bg_phase_interp = np.interp(freqs, bg_freqs, bg_phase) 
                 bg_sdata_interp = bg_mlin_interp*np.exp(1j*bg_phase_interp) 
 
-                # - divide out cal data, write back to the store - #
                 cal_sdata = sdata / bg_sdata_interp 
                 cal_I, cal_Q = np.real(cal_sdata), np.imag(cal_sdata)
                 cal_mlog = (1 + 1*self.power)*10*np.log10(np.sqrt(cal_I**2 + cal_Q**2))  
                 cal_phase = np.unwrap(np.arctan2(cal_Q, cal_I)) 
-                cal_df = pd.DataFrame({
-                    'frequency': freqs,
-                    'I': cal_I,
-                    'Q': cal_Q, 
-                }, index=pd.MultiIndex.from_product(
-                    [[rg], [rgi], ['%06i' % j for j in np.arange(freqs.shape[0])]],
+                
+                cal_df = pd.DataFrame({'frequency': freqs, 'I': cal_I, 'Q': cal_Q}, 
+                    index=pd.MultiIndex.from_product(
+                    [[rg_val], [rgi_val], ['%06i' % j for j in np.arange(freqs.shape[0])]],
                     names=['RecordGroup', 'RecordGroupInd', 'RecordRow'] 
-                    )
-                )
-                self.append('temp_data', cal_df) 
+                ))
+                self.append(f"{tmp_out_prefix}/data", cal_df) 
 
-                # - plot - #
                 if plot:
                     plot_freqs = freqs*1e-9 
-                    color = self._compute_color(sweep_val, sweep_min, sweep_max, sweep_cmap) 
+                    color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap) 
                     if not background_plotted:
                         axs['raw_mag'].plot(plot_freqs, bg_mlog_interp, ls=':', color='black')
                         axs['raw_phase'].plot(plot_freqs, bg_phase_interp, ls=':', color='black')
@@ -860,475 +1134,221 @@ class ResonatorScatteringStore(pd.HDFStore):
                     axs['cal_mag'].plot(plot_freqs, cal_mlog, color=color)
                     axs['cal_phase'].plot(plot_freqs, cal_phase, color=color)
 
-            if '/cal_data' in self.keys():
-                self.remove('/cal_data') 
-            self.get_node('/temp_data')._f_rename('cal_data')
+            out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
+            for k in out_keys: self.remove(k)
+                
+            tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
+            for k in tmp_keys:
+                sub_name = k.split('/')[-1]
+                df = self.select(k)
+                self.append(f"{out_group}/{sub_name}", df)
+                self.remove(k)
+                
+            self._get_index_arrays(f"{out_group}/data")
 
         except Exception as e:
-            # - clean up the temp data groups if the fit errored - # 
-            keys = self.keys()
-            if '/temp_data' in keys: 
-                self.remove('/temp_data')
-            if '/temp_params' in keys: 
-                self.remove('/temp_params')
-
+            for k in self.keys():
+                if k.startswith(tmp_out_prefix): self.remove(k)
             raise e
-
         return ret
 
-    # - RESONATOR PARAMETER FITTING -------------------------------------------------------------- #
-    def fit_res_params(self,
-            frequency_bound=None, inds=None, plot=False, plot_text=False, phase_fit_kwargs=None, fixed_Qc=None,
-            cal=True, sweep_param=None, sweep_cmap='viridis', sweep_label=None, 
+    # - PLOTTING FUNCTIONS ----------------------------------------------------------------------------- #
+    def plot_mag_phase(self,
+            in_group='base', frequency_bound=None, inds=None,
+            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
         ):
-        """ Fit resonator parameters to the calibrated IQ data.
-
+        """ Plot the magnitude and phase for a specified group in the hierarchy.
+        
+        :param in_group: The group path from which to pull data (e.g., 'base' or 'process_0').
         :param frequency_bound: Frequency range over which to plot.
         :param inds: Record start indices to plot over. If None, all available data will be plotted.
-        :param plot: Boolean to indicate if the circle fit results should be plotted. 
-        :param plot_text: Add text with the resonator fit parameters. Only really useful for single traces at the moment.  
-        :param phase_fit_kwargs: Dictionary with keyword arguments for the phase fitting.
-        :param fixed_Qc: Optional fixed value of the coupling Q. 
-        :param sweep_param: String to indicate a swept parameter for a colorbar.
+        :param sweep_param: String formatted as 'subgroup.column' to map uniqueness over.
         :param sweep_cmap: Colormap used to indicate the value of the swept parameter.
         :param sweep_label: String label used to indicate the colorbar.
-        """ 
+        """
+        # Format paths for the targeted hierarchy
+        in_group = '/' + in_group.strip('/')
+        data_group = f"{in_group}/data"
+        
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+
         # - apply indices --------------- #
         if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
+            inds = np.arange(start_inds.shape[0])
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
+            sweep_param_vals = np.arange(start_inds.shape[0])
+            param = 'iter' 
         else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
+            subgroup, param = sweep_param.split('.') 
+            sweep_group_path = f"{in_group}/{subgroup}"
+            sweep_param_vals = self[sweep_group_path][param].values[inds]
+            
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
-        if plot:
-            if plot_text:
-                mosaic = [['iq', 'params'], ['centered_phase', 'centered_phase']]
-            else:
-                mosaic = [['iq'], ['centered_phase']] 
-            fig, axs = self._configure_subplot_mosaic(
-                mosaic,
-                sweep_param_vals=sweep_param_vals,
-                width_ratios=[0.9, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-            axs['iq'].set(
-                xlabel='I',
-                ylabel='Q',
-            )
-            axs['centered_phase'].set(
-                xlabel='Frequency (GHz.)',
-                ylabel=self.phase_ylabel,
-            )
-            if plot_text:
-                axs['params'].set_xticks([])
-                axs['params'].set_yticks([])
-                for key, spine in axs['params'].spines.items():
-                    spine.set_visible(False)
-            ret = fig, axs
-        else:
-            ret = None
+        # - configure figure and axes objects - #
+        fig, axs = self._configure_subplot_mosaic(
+            [['mag'], ['phase']],
+            sweep_param_vals,
+            width_ratios=[0.95, 0.05],
+            sweep_label=sweep_label,
+            sweep_cmap=sweep_cmap,
+        )
+            
+        axs['mag'].set_xticks([]) 
+        axs['phase'].set_xlabel('Frequency (GHz)')
+        axs['mag'].set_ylabel(self.mag_ylabel)
+        axs['phase'].set_ylabel(self.phase_ylabel)
 
-        # - fit 
-        try: 
-            data_group = 'data' if not cal else 'cal_data' 
-            for i, val in zip(inds, sweep_param_vals):
-                ind = self.record_start_inds[i]
-                rg, rgi = self.rg[ind], self.rgi[ind]
-                if param != 'iter':
-                    sweep_val = self._get_group_values(group, i, param=param, frequency_bound=frequency_bound)
-                else:
-                    sweep_val = val
-                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
-                I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
-                mlin = np.sqrt(I**2 + Q**2) 
-                phase = np.unwrap(np.arctan2(Q, I)) 
-                sdata = mlin*np.exp(1j*phase)
-                
-                # - fit a circle, translate to the center - # 
-                xc, yc, r = circle_fit(sdata)
-                Icentered = I - xc
-                Qcentered = Q - yc
-                centered_phase = np.unwrap(np.arctan2(Qcentered, Icentered))
-                
-                # - run a phase fit on the translated circle - #
-                phase_fit_kwargs = {} if phase_fit_kwargs is None else phase_fit_kwargs 
-                params, pcov = self._centered_phase_fit(
-                    freqs, centered_phase,
-                    **phase_fit_kwargs
-                )
-                theta0, Ql, fr = params
-                
-                # - extract the resonator parameters, write them to the store - # 
-                phi = -np.arcsin(yc/r)
-                if self.geometry == 'hanger': 
-                    if fixed_Qc is None: 
-                        Qc = Ql / (2*r*np.exp(-1j*phi))
-                        Qcr = np.real(Qc)
-                        Qi_inv = (1/Ql) - (1/Qcr)
-                        Qi = 1 / Qi_inv
-                    else:
-                        Qcr = fixed_Qc 
-                        Qi = Qcr / (np.cos(phi) - 2*r)
-                        Qci = Qi*Qcr*np.sin(phi) / (2*r*(Qi + Qcr))
-                        Qc = Qcr + 1j*Qci
-                elif self.geometry == 'shunt':
-                    if fixed_Qc is None: 
-                        Qc = 2*Ql / (2*r*np.exp(-1j*phi))
-                        Qcr = np.real(Qc)
-                        Qi_inv = (1/Ql) - (1/Qcr)
-                        Qi = 1 / Qi_inv
-                    else:
-                        Qcr = fixed_Qc 
-                        Qi = Qcr / (np.cos(phi) - r)
-                        Qci = Qi*Qcr*np.sin(phi) / (r*(Qi + Qcr))
-                        Qc = Qcr + 1j*Qci
-                index = pd.MultiIndex.from_product([[rg], [rgi]], names=['RecordGroup', 'RecordGroupInd'])
-                res_params_df = pd.DataFrame({
-                    'Ql': Ql,
-                    'Qi': Qi,
-                    'Qc': Qc,
-                    'phi': phi,
-                    'fr': fr,
-                }, index=index)
-                self.append('temp_params', res_params_df) 
+        # - plot - #
+        for i, val in zip(inds, sweep_param_vals):
+            # Fetch data directly from the target group
+            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
+            freqs *= 1e-9 
+            mlog = (1 + self.power*1)*10*np.log10(np.sqrt(I**2 + Q**2)) 
+            phase = np.unwrap(np.arctan2(Q, I)) 
+            
+            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
+            axs['mag'].plot(freqs, mlog, color=color)
+            axs['phase'].plot(freqs, phase, color=color) 
 
-                # - plot - #
-                if plot:
-                    plot_freqs = freqs * 1e-9
-                    phase_fit = self._centered_phase_func(freqs, theta0, Ql, fr) 
-                    color = self._compute_color(sweep_val, sweep_min, sweep_max, sweep_cmap)
-                    axs['iq'].scatter(I, Q, marker='.', color=color)
-                    circle = plt.Circle((xc, yc), r, edgecolor='r', facecolor='none', linewidth=2)
-                    axs['iq'].add_patch(circle)
-                    axs['centered_phase'].plot(plot_freqs, centered_phase, color=color)
-                    axs['centered_phase'].plot(plot_freqs, phase_fit, ls=':', color='black')
-                    if plot_text:
-                        params_str = '\n'.join([
-                            r'$Q_l = %0.2f$' % Ql,
-                            r'$Q_i = %0.2f$' % Qi,
-                            r'$Q_{cr} = %0.2f$' % np.real(Qc),
-                            r'$\phi = %0.2f$' % phi,
-                            r'$f_r = %0.2f$ (GHz.)' % (fr*1e-9)
-                        ])
-                        axs['params'].text(0.2, 0.2, params_str, fontsize=16)
+        return fig, axs
 
-            if '/res_params' in self.keys():
-                self.remove('/res_params')
-            self.get_node('/temp_params')._f_rename('res_params')
-
-        except Exception as e:
-            # - clean up the temp data groups if the fit errored - # 
-            keys = self.keys()
-            if '/temp_data' in keys: 
-                self.remove('/temp_data')
-            if '/temp_params' in keys: 
-                self.remove('/temp_params')
-
-            raise e
-
-        return ret
-
-    # - PLOTTING FUNCTIONS ----------------------------------------------------------------------- # 
     def plot_mag(self,
-            frequency_bound=None, inds=None,
+            in_group='base', frequency_bound=None, inds=None,
             sweep_param=None, sweep_cmap='viridis', sweep_label=None,
-            cal=True,          
-    ): 
+        ): 
+        """ Plot the magnitude for a specified group in the hierarchy. """
+        in_group = '/' + in_group.strip('/')
+        data_group = f"{in_group}/data"
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+
         # - apply indices --------------- #
         if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
+            inds = np.arange(start_inds.shape[0])
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
+            sweep_param_vals = np.arange(start_inds.shape[0])
+            param = 'iter' 
         else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
+            subgroup, param = sweep_param.split('.') 
+            sweep_group_path = f"{in_group}/{subgroup}"
+            sweep_param_vals = self[sweep_group_path][param].values[inds]
+            
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
-        if '/cal_data' not in self.keys() or not cal:
-            fig, axs = self._configure_subplot_mosaic(
-                [['mag_raw']],
-                sweep_param_vals,
-                width_ratios=[0.9, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-        else:
-            fig, axs = self._configure_subplot_mosaic(
-                [['mag_raw', 'mag_cal']],
-                sweep_param_vals,
-                width_ratios=[0.45, 0.45, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,    
-            )
-            axs['mag_cal'].set(
-                xlabel='Frequency (GHz.)',
-            )
-        axs['mag_raw'].set(
-            xlabel='Frequency (GHz.)',
-            ylabel=self.mag_ylabel
-        ) 
+        fig, axs = self._configure_subplot_mosaic(
+            [['mag']], sweep_param_vals, width_ratios=[0.95, 0.05],
+            sweep_label=sweep_label, sweep_cmap=sweep_cmap,
+        )
+        axs['mag'].set(xlabel='Frequency (GHz)', ylabel=self.mag_ylabel) 
 
         # - plot - #
         for i, val in zip(inds, sweep_param_vals):
-            data = self._get_group_values('data', i, frequency_bound=frequency_bound)
+            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
             I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
             freqs *= 1e-9 
             mlog = (1 + self.power*1)*10*np.log10(np.sqrt(I**2 + Q**2)) 
             color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
-            axs['mag_raw'].plot(freqs, mlog, color=color)
-            if '/cal_data' in self.keys() and cal:
-                cal_data = self._get_group_values('cal_data', i)
-                Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
-                freqs_cal *= 1e-9 
-                mlog_cal = (1 + self.power*1)*10*np.log10(np.sqrt(Ical**2 + Qcal**2)) 
-                axs['mag_cal'].plot(freqs_cal, mlog_cal, color=color)
+            axs['mag'].plot(freqs, mlog, color=color)
 
         return fig, axs
-    
+
     def plot_phase(self,
-            frequency_bound=None, inds=None,
+            in_group='base', frequency_bound=None, inds=None,
             sweep_param=None, sweep_cmap='viridis', sweep_label=None,
-            cal=True,          
-    ): 
+        ): 
+        """ Plot the phase for a specified group in the hierarchy. """
+        in_group = '/' + in_group.strip('/')
+        data_group = f"{in_group}/data"
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+
         # - apply indices --------------- #
         if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
+            inds = np.arange(start_inds.shape[0])
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
+            sweep_param_vals = np.arange(start_inds.shape[0])
+            param = 'iter' 
         else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
+            subgroup, param = sweep_param.split('.') 
+            sweep_group_path = f"{in_group}/{subgroup}"
+            sweep_param_vals = self[sweep_group_path][param].values[inds]
+            
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
-        if '/cal_data' not in self.keys() or not cal:
-            fig, axs = self._configure_subplot_mosaic(
-                [['phase_raw']],
-                sweep_param_vals,
-                width_ratios=[0.9, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-        else:
-            fig, axs = self._configure_subplot_mosaic(
-                [['phase_raw', 'phase_cal']],
-                sweep_param_vals,
-                width_ratios=[0.45, 0.45, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,    
-            )
-            axs['phase_cal'].set(
-                xlabel='Frequency (GHz.)',
-            )
-        axs['phase_raw'].set(
-            xlabel='Frequency (GHz.)',
-            ylabel=self.phase_ylabel
-        ) 
+        fig, axs = self._configure_subplot_mosaic(
+            [['phase']], sweep_param_vals, width_ratios=[0.95, 0.05],
+            sweep_label=sweep_label, sweep_cmap=sweep_cmap,
+        )
+        axs['phase'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel) 
 
         # - plot - #
         for i, val in zip(inds, sweep_param_vals):
-            data = self._get_group_values('data', i, frequency_bound=frequency_bound)
+            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
             I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
             freqs *= 1e-9 
             phase = np.unwrap(np.arctan2(Q, I)) 
             color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
-            axs['phase_raw'].plot(freqs, phase, color=color)
-            if '/cal_data' in self.keys() and cal:
-                cal_data = self._get_group_values('cal_data', i)
-                Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
-                freqs_cal *= 1e-9 
-                phase_cal = np.unwrap(np.arctan2(Qcal, Ical)) 
-                axs['phase_cal'].plot(freqs_cal, phase_cal, color=color)
-
-        return fig, axs
-
-    def plot_mag_phase(self,
-            frequency_bound=None, inds=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
-            cal=True,          
-        ):
-        # - apply indices --------------- #
-        if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
-        if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
-        else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
-
-        # - configure figure and axes objects - #
-        if '/cal_data' not in self.keys() or not cal:
-            fig, axs = self._configure_subplot_mosaic(
-                [['mag_raw'], ['phase_raw']],
-                sweep_param_vals,
-                width_ratios=[0.9, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-        else:
-            fig, axs = self._configure_subplot_mosaic(
-                [['mag_raw', 'mag_cal'], ['phase_raw', 'phase_cal']],
-                sweep_param_vals,
-                width_ratios=[0.45, 0.45, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,    
-            )
-            axs['mag_cal'].set(
-               xticks=[],
-            )
-            axs['phase_cal'].set(
-                xlabel='Frequency (GHz.)',
-            )
-        axs['mag_raw'].set_xticks([]) 
-        axs['phase_raw'].set_xlabel('Frequency (GHz.)')
-        axs['mag_raw'].set_ylabel(self.mag_ylabel)
-        axs['phase_raw'].set_ylabel(self.phase_ylabel)
-
-        # - plot - #
-        for i, val in zip(inds, sweep_param_vals):
-            data = self._get_group_values('data', i, frequency_bound=frequency_bound)
-            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
-            freqs *= 1e-9 
-            mlog = (1 + self.power*1)*10*np.log10(np.sqrt(I**2 + Q**2)) 
-            phase = np.unwrap(np.arctan2(Q, I)) 
-            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
-            axs['mag_raw'].plot(freqs, mlog, color=color)
-            axs['phase_raw'].plot(freqs, phase, color=color) 
-            if '/cal_data' in self.keys() and cal:
-                cal_data = self._get_group_values('cal_data', i)
-                Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
-                freqs_cal *= 1e-9 
-                mlog_cal = (1 + self.power*1)*10*np.log10(np.sqrt(Ical**2 + Qcal**2)) 
-                phase_cal = np.unwrap(np.arctan2(Qcal, Ical)) 
-                axs['mag_cal'].plot(freqs_cal, mlog_cal, color=color)
-                axs['phase_cal'].plot(freqs_cal, phase_cal, color=color)
+            axs['phase'].plot(freqs, phase, color=color)
 
         return fig, axs
 
     def plot_iq(self,
-        frequency_bound=None, inds=None,
-        sweep_param=None, cal_sweep_param=None, 
-        sweep_cmap='viridis', sweep_label=None,
-        cal=True, 
-    ):
-        """ Plot IQ data.
+            in_group='base', frequency_bound=None, inds=None,
+            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
+        ):
+        """ Plot IQ data for a specified group in the hierarchy. """
+        in_group = '/' + in_group.strip('/')
+        data_group = f"{in_group}/data"
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
 
-        :param frequency_bound: Frequency range over which to plot.
-        :param inds: Record start indices to plot over. If None, all available data will be plotted.
-        :param sweep_param: String to indicate a swept parameter for a colorbar.
-        :param cal_sweep_param: String to indicate an alternative sweep parameter for calibration data. 
-        :param sweep_cmap: Colormap used to indicate the value of the swept parameter.
-        :param sweep_label: String label used to indicate the colorbar.
-        """ 
         # - apply indices --------------- #
         if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
+            inds = np.arange(start_inds.shape[0])
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(self.record_start_inds.shape[0])
-            param='iter' 
+            sweep_param_vals = np.arange(start_inds.shape[0])
+            param = 'iter' 
         else:
-            group, param = sweep_param.split('.') 
-            sweep_param_vals = self[group][param].values[inds]
+            subgroup, param = sweep_param.split('.') 
+            sweep_group_path = f"{in_group}/{subgroup}"
+            sweep_param_vals = self[sweep_group_path][param].values[inds]
+            
         sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
 
         # - configure figure and axes objects - #
-        if '/cal_data' not in self.keys() or not cal:
-            fig, axs = self._configure_subplot_mosaic(
-                [['iq_raw']],
-                sweep_param_vals,
-                width_ratios=[0.9, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-        else:
-            fig, axs = self._configure_subplot_mosaic(
-                [['iq_raw'], ['iq_cal']],
-                sweep_param_vals,
-                width_ratios=[0.9, 0.1],
-                sweep_label=sweep_label,
-                sweep_cmap=sweep_cmap,
-            )
-            axs['iq_cal'].set(
-                xlabel='I',
-                ylabel='Q'
-            )
-        axs['iq_raw'].set(
-            xlabel='I',
-            ylabel='Q',
+        fig, axs = self._configure_subplot_mosaic(
+            [['iq']], sweep_param_vals, width_ratios=[0.95, 0.05],
+            sweep_label=sweep_label, sweep_cmap=sweep_cmap,
         )
+        axs['iq'].set(xlabel='I', ylabel='Q')
 
         # - plot - #
         for i, val in zip(inds, sweep_param_vals):
-            if param != 'iter':
-                sweep_val = self._get_group_values(group, i, param=param, frequency_bound=frequency_bound)
-            else:
-                sweep_val = val 
-            color = self._compute_color(sweep_val, sweep_min, sweep_max, sweep_cmap) 
-            data = self._get_group_values('data', i, frequency_bound=frequency_bound)
+            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap) 
+            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
             I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
-            freqs *= 1e-9 
-            axs['iq_raw'].scatter(I, Q, marker='.', color=color)
-            if '/cal_data' in self.keys() and cal: 
-                cal_data = self._get_group_values('cal_data', i)
-                Ical, Qcal, freqs_cal = cal_data.I.values, cal_data.Q.values, cal_data.frequency.values 
-                freqs_cal *= 1e-9 
-                if cal_sweep_param is not None: 
-                    group, param = cal_sweep_param.split('.')
-                    cal_sweep_val = self._get_group_values(group, i, param=param, frequency_bound=frequency_bound)
-                    cal_color = self._compute_color(cal_sweep_val, sweep_min, sweep_max, sweep_cmap) 
-                else:
-                    cal_color = color 
-                axs['iq_cal'].scatter(Ical, Qcal, marker='.', color=cal_color)
+            axs['iq'].scatter(I, Q, marker='.', color=color)
 
         return fig, axs
 
-    def plot_params(self, param_x, param_y, param_x_label=None, param_y_label=None, scatter=True, plot_kwargs={}):
-        """ Plot one or more parameters on a y axis against a single parameter on an x axis.
-        
-        :param param_x: Parameter to plot on the x-axis.
-        :param param_y: Parameter to plot on the y-axis. Single string or list-like.
-        :param param_x_label: String label to use for the plot x-axis.
-        :param param_y_label: String label to use for the plot y-axis. 
-        :param scatter: Boolean to indicate if a scatter plot format should be used. 
-        """
-        xgroup, xparam = param_x.split('.') 
-        xvals = self[xgroup][xparam].values 
-        ygroup, yparam = param_y.split('.') 
-        xvals, yvals = self[xgroup][xparam].values, self[ygroup][yparam].values
-
-        fig, ax = plt.subplots()
-        ax.set(
-            xlabel=param_x if param_x_label is None else param_x_label,
-            ylabel=param_y if param_y_label is None else param_y_label,
-        )
-
-        if scatter:
-            ax.scatter(xvals, yvals, **plot_kwargs)
-        else:
-            ax.plot(xvals, yvals, **plot_kwargs)
-
-        return fig, ax
-
     def plot_res_params(self, 
-            inds=None, xparam=None, xparam_label=None, 
-            frequency_scale='GHz.', frequency_offset=0, 
-            frequency_bound=None, x_cmap='viridis',
-            data_group='cal_data',
+            in_group='base', inds=None, xparam=None, xparam_label=None, 
+            frequency_scale='GHz', frequency_offset=0, params_name='res_params'
         ):
-        """ Plot the fit resonator parameters on a single summary figure.
-        """
+        """ Plot the fit resonator parameters on a single summary figure. """
+        in_group = '/' + in_group.strip('/')
+        data_group = f"{in_group}/data"
+        params_group = f"{in_group}/{params_name}"
+        
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+        
         if inds is None:
-            inds = np.arange(self.record_start_inds.shape[0])
+            inds = np.arange(start_inds.shape[0])
 
         # - configure plot - # 
         fig, axs = plt.subplot_mosaic(
@@ -1349,38 +1369,347 @@ class ResonatorScatteringStore(pd.HDFStore):
         )
 
         # - extract resonator parameters and x sweep value - #
-        res_params = self._get_group_values('res_params', inds) 
+        res_params = self._get_group_values(params_group, inds, index_group=data_group) 
         fr = res_params.fr.values
         ql = res_params.Ql.values
         qi, qc = res_params.Qi.values, res_params.Qc.values.real 
+        
+        # - check for error columns - #
+        fr_err = res_params.fr_err.values if 'fr_err' in res_params.columns else None
+        ql_err = res_params.Ql_err.values if 'Ql_err' in res_params.columns else None
+        qi_err = res_params.Qi_err.values if 'Qi_err' in res_params.columns else None
+        qc_err = res_params.Qc_err.values if 'Qc_err' in res_params.columns else None
+        
+        x_err = None
         if xparam is None: 
             x = np.arange(res_params.shape[0])[inds]
         else:
-            xparam_split = xparam.split('.') 
-            group, param = xparam_split 
-            group_df = self._get_group_values(group, inds) 
+            subgroup, param = xparam.split('.') 
+            sweep_group_path = f"{in_group}/{subgroup}"
+            group_df = self._get_group_values(sweep_group_path, inds, index_group=data_group) 
             x = group_df[param].values
+            
+            # Check for x error column
+            if f"{param}_err" in group_df.columns:
+                x_err = group_df[f"{param}_err"].values
+
+        # - formatting logic - #
+        fr_multiply = {
+            'GHz': 1e-9,
+            'MHz': 1e-6,
+            'kHz': 1e-3,
+            'Hz': 1,
+        }[frequency_scale]
+        
+        # Standard error scales multiplicatively, but ignores constant offsets
+        if fr_err is not None:
+            fr_err = fr_err * fr_multiply
 
         # - plot - #
-        fr_multiply = {
-            'GHz.': 1e-9,
-            'MHz.': 1e-6,
-            'kHz.': 1e-3,
-            'Hz.': 1,
-        }[frequency_scale]
-        axs['fr'].scatter(
-            x, (fr-frequency_offset)*fr_multiply
-        )
-        axs['Ql'].scatter(
-            x, ql
-        )
-        axs['Q'].scatter(
-            x, qi, label=r'$Q_i$'
-        )
-        axs['Q'].scatter(
-            x, qc, label=r'$Q_c$'
-        )
+        axs['fr'].errorbar(x, (fr-frequency_offset)*fr_multiply, xerr=x_err, yerr=fr_err, fmt='o')
+        axs['Ql'].errorbar(x, ql, xerr=x_err, yerr=ql_err, fmt='o')
+        axs['Q'].errorbar(x, qi, xerr=x_err, yerr=qi_err, fmt='o', label=r'$Q_i$')
+        axs['Q'].errorbar(x, qc, xerr=x_err, yerr=qc_err, fmt='o', label=r'$Q_c$')
         axs['Q'].legend()
 
         return fig, axs
+
+    def plot_params(self, in_group, param_x, param_y, param_x_label=None, param_y_label=None, scatter=True, plot_kwargs=None):
+        """ Plot one or more parameters on a y axis against a single parameter on an x axis. """
+        if plot_kwargs is None:
+            plot_kwargs = {}
+            
+        in_group = '/' + in_group.strip('/')
         
+        x_subgroup, x_param = param_x.split('.') 
+        y_subgroup, y_param = param_y.split('.') 
+        
+        x_path = f"{in_group}/{x_subgroup}"
+        y_path = f"{in_group}/{y_subgroup}"
+        
+        xvals = self[x_path][x_param].values 
+        yvals = self[y_path][y_param].values
+
+        fig, ax = plt.subplots()
+        ax.set(
+            xlabel=param_x if param_x_label is None else param_x_label,
+            ylabel=param_y if param_y_label is None else param_y_label,
+        )
+
+        if scatter:
+            ax.scatter(xvals, yvals, **plot_kwargs)
+        else:
+            ax.plot(xvals, yvals, **plot_kwargs)
+
+        return fig, ax
+
+# - RESONATOR PARAMETER FITTING -------------------------------------------------------------- #
+    # - RESONATOR PARAMETER FITTING -------------------------------------------------------------- #
+    def fit_res_params(self,
+            in_group, frequency_bound=None, inds=None, plot=False, plot_text=False, 
+            phase_fit_kwargs=None, fixed_Qc=None, sweep_param=None, 
+            sweep_cmap='viridis', sweep_label=None, 
+        ):
+        """ Fit resonator parameters and standard errors. Writes purely to `in_group/res_params`. """
+        
+        in_group = '/' + in_group.strip('/')
+        data_group = f"{in_group}/data"
+        
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+
+        if inds is None:
+            inds = np.arange(start_inds.shape[0])
+            
+        if sweep_param is None:
+            sweep_param_vals = np.arange(start_inds.shape[0])
+            param = 'iter' 
+        else:
+            subgroup, param = sweep_param.split('.') 
+            sweep_path = f"{in_group}/{subgroup}"
+            sweep_param_vals = self[sweep_path][param].values[inds]
+            
+        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+
+        if plot:
+            if plot_text:
+                mosaic = [['iq', 'params'], ['centered_phase', 'centered_phase']]
+            else:
+                mosaic = [['iq'], ['centered_phase']] 
+            fig, axs = self._configure_subplot_mosaic(
+                mosaic, sweep_param_vals=sweep_param_vals, width_ratios=[0.9, 0.1],
+                sweep_label=sweep_label, sweep_cmap=sweep_cmap,
+            )
+            axs['iq'].set(xlabel='I', ylabel='Q')
+            axs['centered_phase'].set(xlabel='Frequency (GHz.)', ylabel=self.phase_ylabel)
+            if plot_text:
+                axs['params'].set_xticks([])
+                axs['params'].set_yticks([])
+                for key, spine in axs['params'].spines.items(): spine.set_visible(False)
+            ret = fig, axs
+        else:
+            ret = None
+
+        num_inds = len(inds)
+        
+        # Pre-allocate numpy arrays for speed and error tracking
+        Ql_out = np.empty(num_inds, dtype=float)
+        Qi_out = np.empty(num_inds, dtype=float)
+        Qc_out = np.empty(num_inds, dtype=complex)
+        phi_out = np.empty(num_inds, dtype=float)
+        fr_out = np.empty(num_inds, dtype=float)
+        
+        # Note: Standard errors are real magnitudes, even for complex parameters like Qc
+        Ql_err_out = np.empty(num_inds, dtype=float)
+        Qi_err_out = np.empty(num_inds, dtype=float)
+        Qc_err_out = np.empty(num_inds, dtype=float)
+        fr_err_out = np.empty(num_inds, dtype=float)
+        
+        rg_out = np.empty(num_inds, dtype=object)
+        rgi_out = np.empty(num_inds, dtype=object)
+        
+        valid_count = 0
+
+        for i, val in zip(inds, sweep_param_vals):
+            ind = start_inds[i]
+            rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
+            
+            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+            if len(data) == 0:
+                continue
+                
+            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
+            mlin = np.sqrt(I**2 + Q**2) 
+            phase = np.unwrap(np.arctan2(Q, I)) 
+            sdata = mlin*np.exp(1j*phase)
+            
+            xc, yc, r = circle_fit(sdata)
+            Icentered = I - xc
+            Qcentered = Q - yc
+            centered_phase = np.unwrap(np.arctan2(Qcentered, Icentered))
+            
+            phase_fit_kwargs = {} if phase_fit_kwargs is None else phase_fit_kwargs 
+            
+            # - Fit phase and safely extract covariance errors - #
+            try:
+                params, pcov = self._centered_phase_fit(freqs, centered_phase, **phase_fit_kwargs)
+                theta0, Ql, fr = params
+                
+                # Check for bad matrix conditions
+                if np.any(np.isinf(pcov)) or np.any(np.isnan(pcov)):
+                    raise ValueError("Invalid covariance matrix")
+                    
+                # Prevent negative variances due to precision issues
+                perr = np.sqrt(np.maximum(np.diag(pcov), 0))
+                theta0_err, Ql_err, fr_err = perr
+            except Exception:
+                # Skip traces where curve_fit totally fails
+                continue
+            
+            # - Calculate physical variables & propagate errors - #
+            phi = -np.arcsin(yc/r)
+            if self.geometry == 'hanger': 
+                if fixed_Qc is None: 
+                    Qc = Ql / (2*r*np.exp(-1j*phi))
+                    Qcr = np.real(Qc)
+                    Qi = 1 / ((1/Ql) - (1/Qcr))
+                    
+                    # Propagate error linearly relative to Ql
+                    Qi_err = np.abs(Qi * (Ql_err / Ql)) if Ql != 0 else np.nan
+                    Qc_err = np.abs(Qc * (Ql_err / Ql)) if Ql != 0 else np.nan
+                else:
+                    Qcr = fixed_Qc 
+                    Qi = Qcr / (np.cos(phi) - 2*r)
+                    Qc = Qcr + 1j*(Qi*Qcr*np.sin(phi) / (2*r*(Qi + Qcr)))
+                    
+                    Qi_err = 0.0
+                    Qc_err = 0.0
+            elif self.geometry == 'shunt':
+                if fixed_Qc is None: 
+                    Qc = 2*Ql / (2*r*np.exp(-1j*phi))
+                    Qcr = np.real(Qc)
+                    Qi = 1 / ((1/Ql) - (1/Qcr))
+                    
+                    Qi_err = np.abs(Qi * (Ql_err / Ql)) if Ql != 0 else np.nan
+                    Qc_err = np.abs(Qc * (Ql_err / Ql)) if Ql != 0 else np.nan
+                else:
+                    Qcr = fixed_Qc 
+                    Qi = Qcr / (np.cos(phi) - r)
+                    Qc = Qcr + 1j*(Qi*Qcr*np.sin(phi) / (r*(Qi + Qcr)))
+                    
+                    Qi_err = 0.0
+                    Qc_err = 0.0
+                    
+            # Populate pre-allocated arrays
+            Ql_out[valid_count] = Ql
+            Qi_out[valid_count] = Qi
+            Qc_out[valid_count] = Qc
+            phi_out[valid_count] = phi
+            fr_out[valid_count] = fr
+            
+            Ql_err_out[valid_count] = Ql_err
+            Qi_err_out[valid_count] = Qi_err
+            Qc_err_out[valid_count] = Qc_err
+            fr_err_out[valid_count] = fr_err
+            
+            rg_out[valid_count] = rg_val
+            rgi_out[valid_count] = rgi_val
+            
+            valid_count += 1
+
+            if plot:
+                plot_freqs = freqs * 1e-9
+                phase_fit = self._centered_phase_func(freqs, theta0, Ql, fr) 
+                color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
+                axs['iq'].scatter(I, Q, marker='.', color=color)
+                circle = plt.Circle((xc, yc), r, edgecolor='r', facecolor='none', linewidth=2)
+                axs['iq'].add_patch(circle)
+                axs['centered_phase'].plot(plot_freqs, centered_phase, color=color)
+                axs['centered_phase'].plot(plot_freqs, phase_fit, ls=':', color='black')
+                if plot_text:
+                    params_str = '\n'.join([
+                        r'$Q_l = %0.2f \pm %0.2f$' % (Ql, Ql_err),
+                        r'$Q_i = %0.2f \pm %0.2f$' % (Qi, Qi_err),
+                        r'$Q_{cr} = %0.2f \pm %0.2f$' % (np.real(Qc), Qc_err),
+                        r'$\phi = %0.2f$' % phi,
+                        r'$f_r = %0.6f \pm %0.6f$ (GHz.)' % (fr*1e-9, fr_err*1e-9)
+                    ])
+                    axs['params'].text(0.1, 0.2, params_str, fontsize=14)
+
+        if valid_count > 0:
+            # Build final array efficiently
+            res_params_df = pd.DataFrame({
+                'Ql': Ql_out[:valid_count], 
+                'Qi': Qi_out[:valid_count], 
+                'Qc': Qc_out[:valid_count], 
+                'phi': phi_out[:valid_count], 
+                'fr': fr_out[:valid_count],
+                'Ql_err': Ql_err_out[:valid_count],
+                'Qi_err': Qi_err_out[:valid_count],
+                'Qc_err': Qc_err_out[:valid_count],
+                'fr_err': fr_err_out[:valid_count]
+            })
+            
+            res_params_df.index = pd.MultiIndex.from_arrays(
+                [rg_out[:valid_count], rgi_out[:valid_count]], 
+                names=['RecordGroup', 'RecordGroupInd']
+            )
+            
+            target_key = f"{in_group}/res_params"
+            if target_key in self.keys():
+                self.remove(target_key)
+                
+            self.append(target_key, res_params_df)
+
+        return ret
+
+    def find_min_mag_fr(self, in_group, frequency_bound=None, inds=None):
+            """ Find the resonance frequency by identifying the minimum magnitude of the I/Q data.
+            Writes the results to `in_group/min_mag_params`.
+            
+            :param in_group: The input group path from which to pull data (e.g., 'base').
+            :param frequency_bound: Optional tuple of (min_freq, max_freq) to constrain the search.
+            :param inds: Record start indices to process over. If None, all available data is processed.
+            """
+            in_group = '/' + in_group.strip('/')
+            data_group = f"{in_group}/data"
+            
+            rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+
+            if inds is None:
+                inds = np.arange(start_inds.shape[0])
+
+            num_inds = len(inds)
+            
+            # Pre-allocate numpy arrays for speed
+            fr_out = np.empty(num_inds, dtype=float)
+            rg_out = np.empty(num_inds, dtype=object)
+            rgi_out = np.empty(num_inds, dtype=object)
+            
+            valid_count = 0
+
+            for i in inds:
+                ind = start_inds[i]
+                rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
+                
+                # Fetch data using our standard hierarchical helper
+                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+                
+                if len(data) == 0:
+                    continue
+                    
+                I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
+                
+                # Compute linear magnitude
+                mlin = np.sqrt(I**2 + Q**2)
+                
+                # Identify the frequency at the minimum magnitude
+                min_idx = np.argmin(mlin)
+                
+                # Populate pre-allocated arrays
+                fr_out[valid_count] = freqs[min_idx]
+                rg_out[valid_count] = rg_val
+                rgi_out[valid_count] = rgi_val
+                
+                valid_count += 1
+
+            # Build the DataFrame and save it back to the in_group
+            if valid_count > 0:
+                # Slice arrays to only include valid, processed traces
+                fr_out = fr_out[:valid_count]
+                rg_out = rg_out[:valid_count]
+                rgi_out = rgi_out[:valid_count]
+                
+                min_mag_df = pd.DataFrame({'fr': fr_out})
+                
+                # from_arrays is generally much faster than from_tuples
+                min_mag_df.index = pd.MultiIndex.from_arrays(
+                    [rg_out, rgi_out], names=['RecordGroup', 'RecordGroupInd']
+                )
+                
+                out_path = f"{in_group}/min_mag_params"
+                
+                # Safely overwrite if the dataset already exists
+                if out_path in self.keys():
+                    self.remove(out_path)
+                    
+                self.append(out_path, min_mag_df)
