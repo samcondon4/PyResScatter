@@ -37,7 +37,7 @@ class ResonatorScatteringStore(pd.HDFStore):
         self.geometry = geometry 
         self.power = power
         self.sparam = '21' if (self.geometry == 'hanger') else '11'
-        self.mag_ylabel = r'$|S_{%s}|$' % self.sparam 
+        self.mag_ylabel = r'$|S_{%s}|$ (dB)' % self.sparam 
         self.phase_ylabel = r'$\angle S_{%s}$ (rads)' % self.sparam 
         
         self._index_cache = {}
@@ -352,8 +352,7 @@ class ResonatorScatteringStore(pd.HDFStore):
         """ Average the fitted resonator parameters based on unique values of a given sweep parameter.
         
         :param in_group: The input group path from which to pull data (e.g., 'base').
-        :param sweep_param: String formatted as 'subgroup.column' to map uniqueness over 
-                            (e.g., 'meta.power').
+        :param sweep_param: String formatted as 'subgroup.column' to map uniqueness over.
         """
         in_group = '/' + in_group.strip('/')
         params_group = f"{in_group}/res_params"
@@ -377,7 +376,6 @@ class ResonatorScatteringStore(pd.HDFStore):
             matching_indices = sweep_df[sweep_df[param] == val].index
             
             # Intersect with the indices that actually have fitted parameters
-            # (In case some trace fits failed and aren't in res_df)
             valid_indices = matching_indices.intersection(res_df.index)
             
             if len(valid_indices) == 0:
@@ -387,29 +385,47 @@ class ResonatorScatteringStore(pd.HDFStore):
             N = len(subset_df)
             
             row = {}
-            # - Average resonator parameters - #
-            for col in subset_df.columns:
+            
+            # - Average resonator parameters and propagate errors - #
+            # Identify base parameters (e.g., Ql, fr) and exclude the '_err' columns from the main loop
+            base_cols = [c for c in subset_df.columns if not c.endswith('_err')]
+            
+            for col in base_cols:
                 vals = subset_df[col].values
                 row[col] = np.mean(vals)
                 
-                # Calculate standard error of the mean (SEM)
-                if N > 1:
-                    row[f"{col}_err"] = np.std(vals, ddof=1) / np.sqrt(N)
+                # 1. Statistical scatter (Standard Error of the Mean)
+                sem = np.std(vals, ddof=1) / np.sqrt(N) if N > 1 else 0.0
+                
+                # 2. Propagated fit error
+                err_col = f"{col}_err"
+                if err_col in subset_df.columns:
+                    fit_errs = subset_df[err_col].values
+                    # The propagated error of an unweighted mean is sqrt(sum(err^2)) / N
+                    prop_err = np.sqrt(np.sum(fit_errs**2)) / N
+                    
+                    # Combine statistical scatter and propagated measurement error in quadrature
+                    row[err_col] = np.sqrt(sem**2 + prop_err**2)
                 else:
-                    row[f"{col}_err"] = 0.0
+                    row[err_col] = sem
             
-            # - Average the sweep parameter itself - #
+            # - Average the sweep parameter itself and propagate errors - #
             sweep_vals = sweep_df.loc[valid_indices, param].values
             row[param] = np.mean(sweep_vals)
             
-            if N > 1:
-                row[f"{param}_err"] = np.std(sweep_vals, ddof=1) / np.sqrt(N)
+            sweep_sem = np.std(sweep_vals, ddof=1) / np.sqrt(N) if N > 1 else 0.0
+            
+            sweep_err_col = f"{param}_err"
+            if sweep_err_col in sweep_df.columns:
+                sweep_fit_errs = sweep_df.loc[valid_indices, sweep_err_col].values
+                sweep_prop_err = np.sqrt(np.sum(sweep_fit_errs**2)) / N
+                row[sweep_err_col] = np.sqrt(sweep_sem**2 + sweep_prop_err**2)
             else:
-                row[f"{param}_err"] = 0.0
+                row[sweep_err_col] = sweep_sem
                     
             avg_records.append(row)
             
-            # Inherit the exact MultiIndex (RecordGroup, RecordGroupInd) of the FIRST trace in the subselection
+            # Inherit the exact MultiIndex of the FIRST trace in the subselection
             index_tuples.append(valid_indices[0])
             
         if avg_records:
@@ -482,8 +498,8 @@ class ResonatorScatteringStore(pd.HDFStore):
                     sweep_label=sweep_label,
                     sweep_cmap=sweep_cmap,
                 )
-                axs['phase_cal'].set(xlabel='Frequency (GHz.)', ylabel=self.phase_ylabel)
-                axs['phase_raw'].set(xlabel='Frequency (GHz.)', ylabel=self.phase_ylabel)
+                axs['phase_cal'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel)
+                axs['phase_raw'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel)
                 axs['iq_cal'].set(ylabel='Q', xlabel='I')
                 axs['iq_raw'].set(ylabel='Q', xlabel='I')
                 ret = fig, axs
@@ -642,7 +658,7 @@ class ResonatorScatteringStore(pd.HDFStore):
                 for key, ax in axs.items():
                     if 'iq' in key:
                         ax.set(xlabel='I', ylabel='Q')
-                axs['centered_phase'].set(xlabel='Frequency (GHz.)', ylabel=self.phase_ylabel) 
+                axs['centered_phase'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel) 
                 ret = fig, axs
             else:
                 ret = None
@@ -774,8 +790,8 @@ class ResonatorScatteringStore(pd.HDFStore):
                     [['mag_raw'], ['mag_cal']], sweep_param_vals, width_ratios=[0.95, 0.05],
                     sweep_label=sweep_label, sweep_cmap=sweep_cmap,
                 )
-                axs['mag_raw'].set(xlabel='Frequency (GHz.)', ylabel=self.mag_ylabel)
-                axs['mag_cal'].set(xlabel='Frequency (GHz.)', ylabel=self.mag_ylabel)
+                axs['mag_raw'].set(xlabel='Frequency (GHz)', ylabel=self.mag_ylabel)
+                axs['mag_cal'].set(xlabel='Frequency (GHz)', ylabel=self.mag_ylabel)
                 ret = fig, axs
             else:
                 ret = None
@@ -911,8 +927,8 @@ class ResonatorScatteringStore(pd.HDFStore):
                 [['phase_raw'], ['phase_cal']], sweep_param_vals, width_ratios=[0.95, 0.05],
                 sweep_label=sweep_label, sweep_cmap=sweep_cmap,
             )
-            axs['phase_raw'].set(xlabel='Frequency (GHz.)', ylabel=self.phase_ylabel)
-            axs['phase_cal'].set(xlabel='Frequency (GHz.)', ylabel=self.phase_ylabel)
+            axs['phase_raw'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel)
+            axs['phase_cal'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel)
             ret = fig, axs
         else:
             ret = None
@@ -1061,7 +1077,7 @@ class ResonatorScatteringStore(pd.HDFStore):
                 sweep_label=sweep_label, sweep_param_vals=sweep_param_vals,
             )
             for key, ax in axs.items():
-                ax.set_xlabel('Frequency (GHz.)')
+                ax.set_xlabel('Frequency (GHz)')
                 if 'mag' in key: ax.set_ylabel(self.mag_ylabel)
                 else: ax.set_ylabel(self.phase_ylabel)
             ret = fig, axs
@@ -1180,7 +1196,7 @@ class ResonatorScatteringStore(pd.HDFStore):
         )
             
         axs['mag'].set_xticks([]) 
-        axs['phase'].set_xlabel('Frequency (GHz.)')
+        axs['phase'].set_xlabel('Frequency (GHz)')
         axs['mag'].set_ylabel(self.mag_ylabel)
         axs['phase'].set_ylabel(self.phase_ylabel)
 
@@ -1227,7 +1243,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             [['mag']], sweep_param_vals, width_ratios=[0.95, 0.05],
             sweep_label=sweep_label, sweep_cmap=sweep_cmap,
         )
-        axs['mag'].set(xlabel='Frequency (GHz.)', ylabel=self.mag_ylabel) 
+        axs['mag'].set(xlabel='Frequency (GHz)', ylabel=self.mag_ylabel) 
 
         # - plot - #
         for i, val in zip(inds, sweep_param_vals):
@@ -1268,7 +1284,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             [['phase']], sweep_param_vals, width_ratios=[0.95, 0.05],
             sweep_label=sweep_label, sweep_cmap=sweep_cmap,
         )
-        axs['phase'].set(xlabel='Frequency (GHz.)', ylabel=self.phase_ylabel) 
+        axs['phase'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel) 
 
         # - plot - #
         for i, val in zip(inds, sweep_param_vals):
@@ -1322,7 +1338,7 @@ class ResonatorScatteringStore(pd.HDFStore):
 
     def plot_res_params(self, 
             in_group='base', inds=None, xparam=None, xparam_label=None, 
-            frequency_scale='GHz.', frequency_offset=0, params_name='res_params'
+            frequency_scale='GHz', frequency_offset=0, params_name='res_params'
         ):
         """ Plot the fit resonator parameters on a single summary figure. """
         in_group = '/' + in_group.strip('/')
@@ -1379,10 +1395,10 @@ class ResonatorScatteringStore(pd.HDFStore):
 
         # - formatting logic - #
         fr_multiply = {
-            'GHz.': 1e-9,
-            'MHz.': 1e-6,
-            'kHz.': 1e-3,
-            'Hz.': 1,
+            'GHz': 1e-9,
+            'MHz': 1e-6,
+            'kHz': 1e-3,
+            'Hz': 1,
         }[frequency_scale]
         
         # Standard error scales multiplicatively, but ignores constant offsets
@@ -1428,21 +1444,17 @@ class ResonatorScatteringStore(pd.HDFStore):
         return fig, ax
 
 # - RESONATOR PARAMETER FITTING -------------------------------------------------------------- #
+    # - RESONATOR PARAMETER FITTING -------------------------------------------------------------- #
     def fit_res_params(self,
             in_group, frequency_bound=None, inds=None, plot=False, plot_text=False, 
             phase_fit_kwargs=None, fixed_Qc=None, sweep_param=None, 
             sweep_cmap='viridis', sweep_label=None, 
         ):
-        """ Fit resonator parameters. This writes purely to `in_group/res_params`. """
+        """ Fit resonator parameters and standard errors. Writes purely to `in_group/res_params`. """
         
         in_group = '/' + in_group.strip('/')
         data_group = f"{in_group}/data"
-        tmp_out_prefix = '/tmp_fit_process'
         
-        keys = self.keys()
-        for k in keys:
-            if k.startswith(tmp_out_prefix): self.remove(k)
-
         rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
 
         if inds is None:
@@ -1464,7 +1476,7 @@ class ResonatorScatteringStore(pd.HDFStore):
             else:
                 mosaic = [['iq'], ['centered_phase']] 
             fig, axs = self._configure_subplot_mosaic(
-                mosaic, sweep_param_vals=sweep_param_vals, width_ratios=[0.95, 0.05],
+                mosaic, sweep_param_vals=sweep_param_vals, width_ratios=[0.9, 0.1],
                 sweep_label=sweep_label, sweep_cmap=sweep_cmap,
             )
             axs['iq'].set(xlabel='I', ylabel='Q')
@@ -1477,82 +1489,227 @@ class ResonatorScatteringStore(pd.HDFStore):
         else:
             ret = None
 
-        try: 
-            for i, val in zip(inds, sweep_param_vals):
-                ind = start_inds[i]
-                rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
+        num_inds = len(inds)
+        
+        # Pre-allocate numpy arrays for speed and error tracking
+        Ql_out = np.empty(num_inds, dtype=float)
+        Qi_out = np.empty(num_inds, dtype=float)
+        Qc_out = np.empty(num_inds, dtype=complex)
+        phi_out = np.empty(num_inds, dtype=float)
+        fr_out = np.empty(num_inds, dtype=float)
+        
+        # Note: Standard errors are real magnitudes, even for complex parameters like Qc
+        Ql_err_out = np.empty(num_inds, dtype=float)
+        Qi_err_out = np.empty(num_inds, dtype=float)
+        Qc_err_out = np.empty(num_inds, dtype=float)
+        fr_err_out = np.empty(num_inds, dtype=float)
+        
+        rg_out = np.empty(num_inds, dtype=object)
+        rgi_out = np.empty(num_inds, dtype=object)
+        
+        valid_count = 0
+
+        for i, val in zip(inds, sweep_param_vals):
+            ind = start_inds[i]
+            rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
+            
+            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+            if len(data) == 0:
+                continue
                 
-                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
-                I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
-                mlin = np.sqrt(I**2 + Q**2) 
-                phase = np.unwrap(np.arctan2(Q, I)) 
-                sdata = mlin*np.exp(1j*phase)
-                
-                xc, yc, r = circle_fit(sdata)
-                Icentered = I - xc
-                Qcentered = Q - yc
-                centered_phase = np.unwrap(np.arctan2(Qcentered, Icentered))
-                
-                phase_fit_kwargs = {} if phase_fit_kwargs is None else phase_fit_kwargs 
+            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
+            mlin = np.sqrt(I**2 + Q**2) 
+            phase = np.unwrap(np.arctan2(Q, I)) 
+            sdata = mlin*np.exp(1j*phase)
+            
+            xc, yc, r = circle_fit(sdata)
+            Icentered = I - xc
+            Qcentered = Q - yc
+            centered_phase = np.unwrap(np.arctan2(Qcentered, Icentered))
+            
+            phase_fit_kwargs = {} if phase_fit_kwargs is None else phase_fit_kwargs 
+            
+            # - Fit phase and safely extract covariance errors - #
+            try:
                 params, pcov = self._centered_phase_fit(freqs, centered_phase, **phase_fit_kwargs)
                 theta0, Ql, fr = params
                 
-                phi = -np.arcsin(yc/r)
-                if self.geometry == 'hanger': 
-                    if fixed_Qc is None: 
-                        Qc = Ql / (2*r*np.exp(-1j*phi))
-                        Qcr = np.real(Qc)
-                        Qi = 1 / ((1/Ql) - (1/Qcr))
-                    else:
-                        Qcr = fixed_Qc 
-                        Qi = Qcr / (np.cos(phi) - 2*r)
-                        Qc = Qcr + 1j*(Qi*Qcr*np.sin(phi) / (2*r*(Qi + Qcr)))
-                elif self.geometry == 'shunt':
-                    if fixed_Qc is None: 
-                        Qc = 2*Ql / (2*r*np.exp(-1j*phi))
-                        Qcr = np.real(Qc)
-                        Qi = 1 / ((1/Ql) - (1/Qcr))
-                    else:
-                        Qcr = fixed_Qc 
-                        Qi = Qcr / (np.cos(phi) - r)
-                        Qc = Qcr + 1j*(Qi*Qcr*np.sin(phi) / (r*(Qi + Qcr)))
-                        
-                res_params_df = pd.DataFrame({'Ql': Ql, 'Qi': Qi, 'Qc': Qc, 'phi': phi, 'fr': fr}, 
-                    index=pd.MultiIndex.from_product([[rg_val], [rgi_val]], names=['RecordGroup', 'RecordGroupInd']))
-                self.append(f"{tmp_out_prefix}/res_params", res_params_df) 
+                # Check for bad matrix conditions
+                if np.any(np.isinf(pcov)) or np.any(np.isnan(pcov)):
+                    raise ValueError("Invalid covariance matrix")
+                    
+                # Prevent negative variances due to precision issues
+                perr = np.sqrt(np.maximum(np.diag(pcov), 0))
+                theta0_err, Ql_err, fr_err = perr
+            except Exception:
+                # Skip traces where curve_fit totally fails
+                continue
+            
+            # - Calculate physical variables & propagate errors - #
+            phi = -np.arcsin(yc/r)
+            if self.geometry == 'hanger': 
+                if fixed_Qc is None: 
+                    Qc = Ql / (2*r*np.exp(-1j*phi))
+                    Qcr = np.real(Qc)
+                    Qi = 1 / ((1/Ql) - (1/Qcr))
+                    
+                    # Propagate error linearly relative to Ql
+                    Qi_err = np.abs(Qi * (Ql_err / Ql)) if Ql != 0 else np.nan
+                    Qc_err = np.abs(Qc * (Ql_err / Ql)) if Ql != 0 else np.nan
+                else:
+                    Qcr = fixed_Qc 
+                    Qi = Qcr / (np.cos(phi) - 2*r)
+                    Qc = Qcr + 1j*(Qi*Qcr*np.sin(phi) / (2*r*(Qi + Qcr)))
+                    
+                    Qi_err = 0.0
+                    Qc_err = 0.0
+            elif self.geometry == 'shunt':
+                if fixed_Qc is None: 
+                    Qc = 2*Ql / (2*r*np.exp(-1j*phi))
+                    Qcr = np.real(Qc)
+                    Qi = 1 / ((1/Ql) - (1/Qcr))
+                    
+                    Qi_err = np.abs(Qi * (Ql_err / Ql)) if Ql != 0 else np.nan
+                    Qc_err = np.abs(Qc * (Ql_err / Ql)) if Ql != 0 else np.nan
+                else:
+                    Qcr = fixed_Qc 
+                    Qi = Qcr / (np.cos(phi) - r)
+                    Qc = Qcr + 1j*(Qi*Qcr*np.sin(phi) / (r*(Qi + Qcr)))
+                    
+                    Qi_err = 0.0
+                    Qc_err = 0.0
+                    
+            # Populate pre-allocated arrays
+            Ql_out[valid_count] = Ql
+            Qi_out[valid_count] = Qi
+            Qc_out[valid_count] = Qc
+            phi_out[valid_count] = phi
+            fr_out[valid_count] = fr
+            
+            Ql_err_out[valid_count] = Ql_err
+            Qi_err_out[valid_count] = Qi_err
+            Qc_err_out[valid_count] = Qc_err
+            fr_err_out[valid_count] = fr_err
+            
+            rg_out[valid_count] = rg_val
+            rgi_out[valid_count] = rgi_val
+            
+            valid_count += 1
 
-                if plot:
-                    plot_freqs = freqs * 1e-9
-                    phase_fit = self._centered_phase_func(freqs, theta0, Ql, fr) 
-                    color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
-                    axs['iq'].scatter(I, Q, marker='.', color=color)
-                    circle = plt.Circle((xc, yc), r, edgecolor='r', facecolor='none', linewidth=2)
-                    axs['iq'].add_patch(circle)
-                    axs['centered_phase'].plot(plot_freqs, centered_phase, color=color)
-                    axs['centered_phase'].plot(plot_freqs, phase_fit, ls=':', color='black')
-                    if plot_text:
-                        params_str = '\n'.join([
-                            r'$Q_l = %0.2f$' % Ql, r'$Q_i = %0.2f$' % Qi, r'$Q_{cr} = %0.2f$' % np.real(Qc),
-                            r'$\phi = %0.2f$' % phi, r'$f_r = %0.2f$ (GHz.)' % (fr*1e-9)
-                        ])
-                        axs['params'].text(0.2, 0.2, params_str, fontsize=16)
+            if plot:
+                plot_freqs = freqs * 1e-9
+                phase_fit = self._centered_phase_func(freqs, theta0, Ql, fr) 
+                color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
+                axs['iq'].scatter(I, Q, marker='.', color=color)
+                circle = plt.Circle((xc, yc), r, edgecolor='r', facecolor='none', linewidth=2)
+                axs['iq'].add_patch(circle)
+                axs['centered_phase'].plot(plot_freqs, centered_phase, color=color)
+                axs['centered_phase'].plot(plot_freqs, phase_fit, ls=':', color='black')
+                if plot_text:
+                    params_str = '\n'.join([
+                        r'$Q_l = %0.2f \pm %0.2f$' % (Ql, Ql_err),
+                        r'$Q_i = %0.2f \pm %0.2f$' % (Qi, Qi_err),
+                        r'$Q_{cr} = %0.2f \pm %0.2f$' % (np.real(Qc), Qc_err),
+                        r'$\phi = %0.2f$' % phi,
+                        r'$f_r = %0.6f \pm %0.6f$ (GHz.)' % (fr*1e-9, fr_err*1e-9)
+                    ])
+                    axs['params'].text(0.1, 0.2, params_str, fontsize=14)
 
-            # - Only overwrite the res_params dataset in in_group - #
+        if valid_count > 0:
+            # Build final array efficiently
+            res_params_df = pd.DataFrame({
+                'Ql': Ql_out[:valid_count], 
+                'Qi': Qi_out[:valid_count], 
+                'Qc': Qc_out[:valid_count], 
+                'phi': phi_out[:valid_count], 
+                'fr': fr_out[:valid_count],
+                'Ql_err': Ql_err_out[:valid_count],
+                'Qi_err': Qi_err_out[:valid_count],
+                'Qc_err': Qc_err_out[:valid_count],
+                'fr_err': fr_err_out[:valid_count]
+            })
+            
+            res_params_df.index = pd.MultiIndex.from_arrays(
+                [rg_out[:valid_count], rgi_out[:valid_count]], 
+                names=['RecordGroup', 'RecordGroupInd']
+            )
+            
             target_key = f"{in_group}/res_params"
             if target_key in self.keys():
                 self.remove(target_key)
                 
-            tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
-            for k in tmp_keys:
-                sub_name = k.split('/')[-1]
-                df = self.select(k)
-                self.append(f"{in_group}/{sub_name}", df)
-                self.remove(k)
+            self.append(target_key, res_params_df)
 
-        except Exception as e:
-            for k in self.keys():
-                if k.startswith(tmp_out_prefix): self.remove(k)
-            raise e
         return ret
 
+    def find_min_mag_fr(self, in_group, frequency_bound=None, inds=None):
+            """ Find the resonance frequency by identifying the minimum magnitude of the I/Q data.
+            Writes the results to `in_group/min_mag_params`.
+            
+            :param in_group: The input group path from which to pull data (e.g., 'base').
+            :param frequency_bound: Optional tuple of (min_freq, max_freq) to constrain the search.
+            :param inds: Record start indices to process over. If None, all available data is processed.
+            """
+            in_group = '/' + in_group.strip('/')
+            data_group = f"{in_group}/data"
+            
+            rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
 
+            if inds is None:
+                inds = np.arange(start_inds.shape[0])
+
+            num_inds = len(inds)
+            
+            # Pre-allocate numpy arrays for speed
+            fr_out = np.empty(num_inds, dtype=float)
+            rg_out = np.empty(num_inds, dtype=object)
+            rgi_out = np.empty(num_inds, dtype=object)
+            
+            valid_count = 0
+
+            for i in inds:
+                ind = start_inds[i]
+                rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
+                
+                # Fetch data using our standard hierarchical helper
+                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+                
+                if len(data) == 0:
+                    continue
+                    
+                I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
+                
+                # Compute linear magnitude
+                mlin = np.sqrt(I**2 + Q**2)
+                
+                # Identify the frequency at the minimum magnitude
+                min_idx = np.argmin(mlin)
+                
+                # Populate pre-allocated arrays
+                fr_out[valid_count] = freqs[min_idx]
+                rg_out[valid_count] = rg_val
+                rgi_out[valid_count] = rgi_val
+                
+                valid_count += 1
+
+            # Build the DataFrame and save it back to the in_group
+            if valid_count > 0:
+                # Slice arrays to only include valid, processed traces
+                fr_out = fr_out[:valid_count]
+                rg_out = rg_out[:valid_count]
+                rgi_out = rgi_out[:valid_count]
+                
+                min_mag_df = pd.DataFrame({'fr': fr_out})
+                
+                # from_arrays is generally much faster than from_tuples
+                min_mag_df.index = pd.MultiIndex.from_arrays(
+                    [rg_out, rgi_out], names=['RecordGroup', 'RecordGroupInd']
+                )
+                
+                out_path = f"{in_group}/min_mag_params"
+                
+                # Safely overwrite if the dataset already exists
+                if out_path in self.keys():
+                    self.remove(out_path)
+                    
+                self.append(out_path, min_mag_df)
