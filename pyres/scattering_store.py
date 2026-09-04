@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import numpy as np
 from numpy.polynomial import Polynomial
@@ -47,8 +48,6 @@ class ResonatorScatteringStore(pd.HDFStore):
         for k in keys:
             if k.startswith('/tmp_') or '/tmp_avg_process' in k:
                 self.remove(k)
-        # (Note: Removing tmp files here will leave "dead space", but you can always
-        # run ResonatorScatteringStore.repack('my_file.h5') manually later if it gets bloated).
 
         # - Cache indices for the base data group - #
         if '/base/data' in self.keys() or 'base/data' in self.keys():
@@ -57,21 +56,23 @@ class ResonatorScatteringStore(pd.HDFStore):
     # - STATIC METHODS ------------------------------------------------------------------------------------------- #
     @staticmethod
     def _repack(filepath, key_mapping=None):
-        """ Repack an HDF5 file to reclaim disk space.
+        """ 
+        Repack an HDF5 file to reclaim disk space.
         
         :param filepath: Path to the HDF5 file.
+        :type filepath: str
         :param key_mapping: Optional dictionary mapping old keys to new keys to rename groups 
                             during the repacking process without doubling file size.
+        :type key_mapping: dict, optional
         """
         if not os.path.exists(filepath):
             return
             
         key_mapping = key_mapping or {}
         
-        # Create tmp file in the same directory to ensure atomic os.replace across filesystems
         dir_name = os.path.dirname(os.path.abspath(filepath))
         tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.h5')
-        os.close(tmp_fd) # Close OS-level file descriptor so pandas can open it safely
+        os.close(tmp_fd) 
         
         try:
             with pd.HDFStore(filepath, mode='r') as store_in, pd.HDFStore(tmp_path, mode='w') as store_out:
@@ -80,23 +81,26 @@ class ResonatorScatteringStore(pd.HDFStore):
                     new_key = key_mapping.get(key, key)
                     store_out.put(new_key, df, format='table')
                     
-            # Atomically replace the bloated file with the fresh, repacked file
             os.replace(tmp_path, filepath)
         except Exception as e:
-            # Clean up the temp file if something fails
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise e
     
     @staticmethod
     def _compute_color(val, vmin, vmax, cmap='viridis'):
-        """ Convert a value between a minimum and maximum to an integer between
+        """ 
+        Convert a value between a minimum and maximum to an integer between
         0 and 256 for use in a colormap.
         
         :param val: Integer value to convert to a color.
+        :type val: int or float
         :param vmin: Minimum integer value that val can take.
+        :type vmin: int or float
         :param vmax: Maximum integer value that val can take.
+        :type vmax: int or float
         :param cmap: String identifying the colormap to use.
+        :type cmap: str
         """        
         cmap = mpl.colormaps.get_cmap(cmap)
         if vmin == vmax:
@@ -116,10 +120,19 @@ class ResonatorScatteringStore(pd.HDFStore):
     
     @staticmethod
     def _configure_subplot_mosaic(mosaic, sweep_param_vals, width_ratios=None, sweep_cmap='viridis', sweep_label=None):
-        """ Configure a subplot mosaic and colorbar.
+        """ 
+        Configure a subplot mosaic and colorbar.
 
         :param mosaic: List used as input to the subplot_mosaic call.
+        :type mosaic: list
         :param sweep_param_vals: Array with the parameter sweep data.
+        :type sweep_param_vals: numpy.ndarray
+        :param width_ratios: Ratios determining the relative widths of the columns.
+        :type width_ratios: list, optional
+        :param sweep_cmap: Colormap for the sweep parameter. Defaults to 'viridis'.
+        :type sweep_cmap: str, optional
+        :param sweep_label: Label for the colorbar.
+        :type sweep_label: str, optional
         """
         if sweep_param_vals.shape[0] == 1:
             fig, axs = plt.subplot_mosaic(mosaic) 
@@ -152,50 +165,46 @@ class ResonatorScatteringStore(pd.HDFStore):
         return params, pcov
 
     # - INTERNAL HELPERS ---------------------------------------------------------------------------------------- #
-    def _get_group_values(self, group, index, param=None, frequency_bound=None, index_group=None):
-            """ Return the dataframe from the group at the specified index.
+    def _get_group_values(self, group, index=None, param=None, index_group=None):
+            """ 
+            Return the dataframe from the group at the specified index.
 
             :param group: String corresponding to the hierarchical HDF group to pull the dataframe from.
+            :type group: str
             :param index: Index from the RecordGroup and RecordGroupInd list to pull dataframe from.
+            :type index: int
             :param param: Parameter to pull from the dataframe. 
-            :param frequency_bound: Frequency limits to take HDF group data between. 
+            :type param: str, optional
             :param index_group: The baseline data group whose indexing scheme should be used. 
                                 If None, defaults to the 'data' group in the same parent directory.
+            :type index_group: str, optional
             """
-            # Ensure consistent absolute pathing
             group = '/' + group.strip('/')
             
             if index_group is None:
-                # If no index_group provided, guess the corresponding data group. 
-                # e.g., '/base/meta' -> '/base/data'
                 parent_path = group.rsplit('/', 1)[0]
                 index_group = f"{parent_path}/data"
             else:
                 index_group = '/' + index_group.strip('/')
                 
             rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(index_group)
-            ind = start_inds[index]
-            
+            if index is not None: 
+                ind = start_inds[index]
+            else:
+                ind = start_inds
+
             try:
                 iter(ind)
             except TypeError:
                 rg, rgi = rg_arr[ind], rgi_arr[ind] 
                 where_str = f'RecordGroup == "{rg}" & RecordGroupInd == "{rgi}"'
+                df = self.select(group, where=where_str) 
             else:
-                rg, rgi = rg_arr[ind], rgi_arr[ind] 
-                rgmin, rgmax = rg.min(), rg.max()
-                rgimin, rgimax = rgi.min(), rgi.max()
-                where_str = ' & '.join([
-                        f'RecordGroup >= "{rgmin}" & RecordGroup <= "{rgmax}"',
-                        f'RecordGroupInd >= "{rgimin}" & RecordGroupInd <= "{rgimax}"'
-                    ])
-                    
-            df = self.select(group, where=where_str)
-            
-            if frequency_bound is not None and 'frequency' in df.columns:
-                freqs = df.frequency.values 
-                inds_bound = (frequency_bound[0] < freqs) * (freqs < frequency_bound[1])
-                df = df.iloc[inds_bound]
+                df = pd.DataFrame() 
+                for i in ind:
+                    rg, rgi = rg_arr[i], rgi_arr[i] 
+                    where_str = f'RecordGroup == "{rg}" & RecordGroupInd == "{rgi}"'
+                    df = pd.concat([df, self.select(group, where=where_str)])
                 
             if param is not None:
                 ret = df[param].values
@@ -205,9 +214,11 @@ class ResonatorScatteringStore(pd.HDFStore):
             return ret
     
     def _get_index_arrays(self, data_group):
-        """ Read and cache the index structures for any data group in the hierarchy. 
+        """ 
+        Read and cache the index structures for any data group in the hierarchy. 
         
         :param data_group: String corresponding to the hierarchical path of the data group.
+        :type data_group: str
         """
         if not data_group.startswith('/'):
             data_group = '/' + data_group
@@ -224,36 +235,149 @@ class ResonatorScatteringStore(pd.HDFStore):
         return self._index_cache[data_group]
 
     # - GENERAL PROCESSING FUNCTIONS ------------------------------------------------------------------ #
-    def average_traces_on_sweep(self, in_group, out_group, sweep_param):
-        """ Average traces based on unique values of a given sweep parameter.
+    def group_query(self, in_group, query, inds=None):
+        """
+        Filter plotting `inds` and data points based on a pandas query string.
+        Supports mixing trace-level parameters and meta-level scalar parameters.
+        
+        :param in_group: The group path from which to pull data (e.g., 'base' or 'process_0').
+        :type in_group: str
+        :param query: Pandas query string using subgroup.column syntax (e.g., 'data.frequency < 5e9').
+        :type query: str
+        :param inds: Specific trace indices to query over. If None, queries all traces.
+        :type inds: numpy.ndarray or list, optional
+        :return: A tuple of (valid_inds, point_masks), where valid_inds is an array of 
+                 surviving trace indices, and point_masks is a dictionary mapping 
+                 the trace ind to an array of valid RecordRow index labels (or None if 
+                 only meta-level queries were executed).
+        :rtype: tuple(numpy.ndarray, dict or None)
+        """
+        in_group_clean = '/' + in_group.strip('/')
+        data_group = f"{in_group_clean}/data"
+        
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+        
+        if inds is None:
+            inds = np.arange(start_inds.shape[0])
+
+        if query is None or not str(query).strip():
+            return inds, None
+            
+        pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
+        matches = re.findall(pattern, query)
+        
+        if not matches:
+            return inds, None
+            
+        subgroups = list(set([m[0] for m in matches]))
+        
+        trace_dfs = []
+        meta_dfs = []
+        
+        for sg in subgroups:
+            path = f"{in_group_clean}/{sg}"
+            df_sg = self._get_group_values(path, inds, index_group=data_group).copy()
+            
+            is_trace = ('RecordRow' in df_sg.index.names) or ('frequency' in df_sg.columns)
+            
+            df_sg = df_sg.rename(columns={col: f"{sg}_{col}" for col in df_sg.columns})
+            
+            if is_trace:
+                trace_dfs.append(df_sg)
+            else:
+                meta_dfs.append(df_sg)
+        
+        meta_combined = None
+        if meta_dfs:
+            meta_combined = pd.concat(meta_dfs, axis=1)
+            meta_combined = meta_combined.loc[:, ~meta_combined.columns.duplicated()]
+            
+        trace_combined = None
+        if trace_dfs:
+            trace_combined = pd.concat(trace_dfs, axis=1)
+            trace_combined = trace_combined.loc[:, ~trace_combined.columns.duplicated()]
+            
+        if trace_combined is not None and meta_combined is not None:
+            combined_df = trace_combined.join(meta_combined)
+        elif trace_combined is not None:
+            combined_df = trace_combined
+        else:
+            combined_df = meta_combined
+            
+        parsed_query = re.sub(pattern, r'\1_\2', query)
+        
+        filtered_df = combined_df.query(parsed_query)
+        
+        if filtered_df.empty:
+            return np.array([], dtype=int), None
+            
+        trace_key_to_ind = {
+            (rg_arr[start_inds[i]], rgi_arr[start_inds[i]]): i 
+            for i in inds
+        }
+        
+        valid_inds = []
+        point_masks = None
+        
+        if 'RecordRow' in filtered_df.index.names:
+            surviving_keys = filtered_df.index.droplevel('RecordRow').unique()
+            point_masks = {}
+            for (rg, rgi), subset in filtered_df.groupby(level=['RecordGroup', 'RecordGroupInd']):
+                if (rg, rgi) in trace_key_to_ind:
+                    ind = trace_key_to_ind[(rg, rgi)]
+                    point_masks[ind] = subset.index.get_level_values('RecordRow').values
+        else:
+            surviving_keys = filtered_df.index.unique()
+            
+        for key in surviving_keys:
+            if key in trace_key_to_ind:
+                valid_inds.append(trace_key_to_ind[key])
+                
+        return np.array(sorted(valid_inds)), point_masks
+    
+    def average_traces_on_sweep(self, in_group, out_group, sweep_param, query=None):
+        """ 
+        Average traces based on unique values of a given sweep parameter.
         
         :param in_group: The input group path from which to pull data (e.g., 'base').
+        :type in_group: str
         :param out_group: The output group path to write the averaged traces into (e.g., 'process_0'). 
                           Supports overwriting if in_group == out_group.
+        :type out_group: str
         :param sweep_param: String formatted as 'subgroup.column' to map uniqueness over 
                             (e.g., 'meta.power').
+        :type sweep_param: str
+        :param query: Optional pandas query string to filter traces prior to averaging. 
+                      Point-level masking is not supported for this method.
+        :type query: str, optional
         """
-        # Ensure paths have a consistent absolute format (e.g. '/base')
         in_group = '/' + in_group.strip('/')
         out_group = '/' + out_group.strip('/')
+        data_group = f"{in_group}/data"
         
         subgroup, param = sweep_param.split('.')
         sweep_path = f"{in_group}/{subgroup}"
         
-        # Load the sweep parameter dataframe
         sweep_df = self.select(sweep_path)
+        
+        if query is not None:
+            inds, point_masks = self.group_query(in_group, query)
+            if point_masks is not None and len(point_masks) > 0:
+                raise ValueError("Point-level queries (e.g., masking specific frequencies) are not supported for average_traces_on_sweep as averaging requires consistent array shapes.")
+                
+            rg_arr, rgi_arr, _, start_inds = self._get_index_arrays(data_group)
+            valid_tuples = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
+            valid_index = pd.MultiIndex.from_tuples(valid_tuples, names=['RecordGroup', 'RecordGroupInd'])
+            sweep_df = sweep_df.loc[sweep_df.index.intersection(valid_index)]
+
         unique_vals = pd.unique(sweep_df[param])
         
-        # Identify and load all metadata-like groups (everything under in_group except data)
-        # This dynamically captures /meta, /proc_params, or anything else alongside /data
         keys = self.keys()
         meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
         meta_dfs = {k: self.select(k) for k in meta_keys}
         
-        data_group = f"{in_group}/data"
         tmp_out_prefix = '/tmp_avg_process'
         
-        # Clear any leftover tmp groups from a previously crashed run
         for k in keys:
             if k.startswith(tmp_out_prefix):
                 self.remove(k)
@@ -264,7 +388,6 @@ class ResonatorScatteringStore(pd.HDFStore):
             I_list, Q_list = [], []
             freqs = None
             
-            # Retrieve traces for this sweep value
             for idx in matching_sweep_df.index:
                 rg_val, rgi_val = idx[0], idx[1]
                 where_str = f'RecordGroup == "{rg_val}" & RecordGroupInd == "{rgi_val}"'
@@ -285,18 +408,15 @@ class ResonatorScatteringStore(pd.HDFStore):
             I_avg = np.mean(I_list, axis=0)
             Q_avg = np.mean(Q_list, axis=0)
             
-            # Calculate standard error of the mean (SEM)
             if N > 1:
                 I_err = np.std(I_list, axis=0, ddof=1) / np.sqrt(N)
                 Q_err = np.std(Q_list, axis=0, ddof=1) / np.sqrt(N)
             else:
-                # If only one trace exists, standard error is zero
                 I_err = np.zeros_like(I_avg)
                 Q_err = np.zeros_like(Q_avg)
                 
             new_rg, new_rgi = '000000', '%06i' % i
             
-            # Write Averaged Data to temporary group
             data_index = pd.MultiIndex.from_product(
                 [[new_rg], [new_rgi], ['%06i' % j for j in range(len(freqs))]],
                 names=['RecordGroup', 'RecordGroupInd', 'RecordRow']
@@ -311,7 +431,6 @@ class ResonatorScatteringStore(pd.HDFStore):
             }, index=data_index)
             self.append(f"{tmp_out_prefix}/data", avg_df)
             
-            # Write Processed Metadata and Proc Params to temporary groups
             meta_index = pd.MultiIndex.from_product(
                 [[new_rg], [new_rgi]],
                 names=['RecordGroup', 'RecordGroupInd']
@@ -324,20 +443,16 @@ class ResonatorScatteringStore(pd.HDFStore):
                     new_row = m_df.loc[[first_idx]].copy()
                     new_row.index = meta_index
                     
-                    # Ensure the sweep param explicitly reflects this value
                     if m_key == sweep_path:
                         new_row[param] = val
                         
                     sub_name = m_key.split('/')[-1]
                     self.append(f"{tmp_out_prefix}/{sub_name}", new_row)
                     
-        # Replace out_group with the newly generated temporary groups
-        # We delete the destination keys first to cleanly support 'in_group == out_group' overwriting
         out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
         for k in out_keys:
             self.remove(k)
             
-        # Move temporary groups into the final out_group
         tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
         for k in tmp_keys:
             sub_name = k.split('/')[-1]
@@ -345,14 +460,18 @@ class ResonatorScatteringStore(pd.HDFStore):
             self.append(f"{out_group}/{sub_name}", df)
             self.remove(k)
             
-        # Cache the index for the newly generated output data group
         self._get_index_arrays(f"{out_group}/data")
 
-    def average_res_params_on_sweep(self, in_group, sweep_param):
-        """ Average the fitted resonator parameters based on unique values of a given sweep parameter.
+    def average_res_params_on_sweep(self, in_group, sweep_param, query=None):
+        """ 
+        Average the fitted resonator parameters based on unique values of a given sweep parameter.
         
         :param in_group: The input group path from which to pull data (e.g., 'base').
+        :type in_group: str
         :param sweep_param: String formatted as 'subgroup.column' to map uniqueness over.
+        :type sweep_param: str
+        :param query: Optional pandas query string to filter parameters prior to averaging.
+        :type query: str, optional
         """
         in_group = '/' + in_group.strip('/')
         params_group = f"{in_group}/res_params"
@@ -366,16 +485,20 @@ class ResonatorScatteringStore(pd.HDFStore):
         sweep_df = self.select(sweep_path)
         res_df = self.select(params_group)
         
+        if query is not None:
+            inds, _ = self.group_query(in_group, query)
+            rg_arr, rgi_arr, _, start_inds = self._get_index_arrays(f"{in_group}/data")
+            valid_tuples = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
+            valid_index = pd.MultiIndex.from_tuples(valid_tuples, names=['RecordGroup', 'RecordGroupInd'])
+            res_df = res_df.loc[res_df.index.intersection(valid_index)]
+        
         unique_vals = pd.unique(sweep_df[param])
         
         avg_records = []
         index_tuples = []
         
         for val in unique_vals:
-            # Find matching indices in the sweep metadata
             matching_indices = sweep_df[sweep_df[param] == val].index
-            
-            # Intersect with the indices that actually have fitted parameters
             valid_indices = matching_indices.intersection(res_df.index)
             
             if len(valid_indices) == 0:
@@ -386,30 +509,22 @@ class ResonatorScatteringStore(pd.HDFStore):
             
             row = {}
             
-            # - Average resonator parameters and propagate errors - #
-            # Identify base parameters (e.g., Ql, fr) and exclude the '_err' columns from the main loop
             base_cols = [c for c in subset_df.columns if not c.endswith('_err')]
             
             for col in base_cols:
                 vals = subset_df[col].values
                 row[col] = np.mean(vals)
                 
-                # 1. Statistical scatter (Standard Error of the Mean)
                 sem = np.std(vals, ddof=1) / np.sqrt(N) if N > 1 else 0.0
                 
-                # 2. Propagated fit error
                 err_col = f"{col}_err"
                 if err_col in subset_df.columns:
                     fit_errs = subset_df[err_col].values
-                    # The propagated error of an unweighted mean is sqrt(sum(err^2)) / N
                     prop_err = np.sqrt(np.sum(fit_errs**2)) / N
-                    
-                    # Combine statistical scatter and propagated measurement error in quadrature
                     row[err_col] = np.sqrt(sem**2 + prop_err**2)
                 else:
                     row[err_col] = sem
             
-            # - Average the sweep parameter itself and propagate errors - #
             sweep_vals = sweep_df.loc[valid_indices, param].values
             row[param] = np.mean(sweep_vals)
             
@@ -425,14 +540,12 @@ class ResonatorScatteringStore(pd.HDFStore):
                     
             avg_records.append(row)
             
-            # Inherit the exact MultiIndex of the FIRST trace in the subselection
             index_tuples.append(valid_indices[0])
             
         if avg_records:
             avg_res_df = pd.DataFrame(avg_records)
             avg_res_df.index = pd.MultiIndex.from_tuples(index_tuples, names=['RecordGroup', 'RecordGroupInd'])
             
-            # Safely overwrite if it already exists
             out_path = f"{in_group}/avg_res_params"
             if out_path in self.keys():
                 self.remove(out_path)
@@ -443,31 +556,41 @@ class ResonatorScatteringStore(pd.HDFStore):
     def calibrate_cable_delay(self, 
                 in_group, out_group,
                 tau=None, offset=None, 
-                frequency_bound=None, fit_frequency_bound=None, inds=None, 
+                fit_frequency_bound=None, inds=None, query=None,
                 plot=False, sweep_param=None, sweep_cmap='viridis', sweep_label=None,
             ):
-            """ Remove a line from the unwrapped phase data.
+            """ 
+            Remove a line from the unwrapped phase data.
             
             :param in_group: The group path from which to pull data (e.g., 'base').
+            :type in_group: str
             :param out_group: The output group path to write the calibrated data into (e.g., 'cal_cable').
-                            Supports overwriting if in_group == out_group.
+                              Supports overwriting if in_group == out_group.
+            :type out_group: str
             :param tau: Fixed cable delay slope. If None a line will be fit to the unwrapped phase.
+            :type tau: float, optional
             :param offset: Fixed cable delay offset.
-            :param frequency_bound: Frequency range over which calibration should be performed. 
+            :type offset: float, optional
             :param fit_frequency_bound: Frequency range over which a line fit should be performed. 
+            :type fit_frequency_bound: tuple, optional
             :param inds: Indices over which to perform the calibration. 
+            :type inds: list or numpy.ndarray, optional
+            :param query: Optional pandas query string to filter traces and points.
+            :type query: str, optional
             :param plot: Boolean to indicate if a plot showing the calibration results should be generated. 
+            :type plot: bool, optional
             :param sweep_param: String to indicate a parameter that is swept over in the data.
+            :type sweep_param: str, optional
             :param sweep_cmap: Colormap to use to indicate the value of the swept parameter.
+            :type sweep_cmap: str, optional
             :param sweep_label: String label used to label the colorbar. 
+            :type sweep_label: str, optional
             """
-            # - Format paths - #
             in_group = '/' + in_group.strip('/')
             out_group = '/' + out_group.strip('/')
             data_group = f"{in_group}/data"
             tmp_out_prefix = '/tmp_cal_process'
             
-            # - Clean any leftover temp groups from a previously crashed run - #
             keys = self.keys()
             for k in keys:
                 if k.startswith(tmp_out_prefix):
@@ -475,20 +598,25 @@ class ResonatorScatteringStore(pd.HDFStore):
 
             rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
 
-            # - apply indices ------------------------------------------------------------- # 
             if inds is None:
                 inds = np.arange(start_inds.shape[0])
+                
+            point_masks = None
+            if query is not None:
+                inds, point_masks = self.group_query(in_group, query, inds)
 
-            # - set up sweep parameter and plot ------------------------------------------- #
             if sweep_param is None:
-                sweep_param_vals = np.arange(start_inds.shape[0])
+                sweep_param_vals = np.arange(start_inds.shape[0])[inds] if len(inds) > 0 else np.array([])
                 param = 'iter' 
             else:
                 subgroup, param = sweep_param.split('.') 
                 sweep_path = f"{in_group}/{subgroup}"
                 sweep_param_vals = self[sweep_path][param].values[inds]
                 
-            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max()
+            if len(sweep_param_vals) > 0:
+                sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max()
+            else:
+                sweep_min, sweep_max = 0, 1
             
             if plot:
                 fig, axs = self._configure_subplot_mosaic(
@@ -507,29 +635,34 @@ class ResonatorScatteringStore(pd.HDFStore):
                 ret = None
 
             try: 
-                # - Copy over non-data metadata (meta, proc_params, etc.) in bulk for speed - #
                 target_indices = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
                 meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
                 for m_key in meta_keys:
                     m_df = self.select(m_key)
-                    # Filter to only the indices we are actually calibrating
                     subset_df = m_df.loc[m_df.index.isin(target_indices)]
                     sub_name = m_key.split('/')[-1]
                     self.put(f"{tmp_out_prefix}/{sub_name}", subset_df, format='table')
                 
-                # - Process and calibrate data iteratively ------------------------------------ # 
                 for i, val in zip(inds, sweep_param_vals): 
                     ind = start_inds[i] 
                     rg_val, rgi_val = rg_arr[ind], rgi_arr[ind] 
 
-                    # Fetch raw trace
-                    data = self._get_group_values(data_group, i, frequency_bound=frequency_bound) 
+                    data = self._get_group_values(data_group, i) 
+                    
+                    if point_masks is not None and i in point_masks:
+                        valid_rows = point_masks[i]
+                        if 'RecordRow' in data.index.names:
+                            mask = data.index.get_level_values('RecordRow').isin(valid_rows)
+                            data = data.loc[mask]
+                            
+                    if data.empty:
+                        continue
+                        
                     freqs = data.frequency.values  
                     I, Q = data.I.values, data.Q.values
                     phase = np.unwrap(np.arctan2(Q, I))
                     mlin = np.sqrt(I**2 + Q**2)
                     
-                    # Apply fitting bounds if provided
                     if fit_frequency_bound is not None:
                         fit_inds_arr = (fit_frequency_bound[0] < freqs) * (freqs < fit_frequency_bound[1])
                         fit_freqs = freqs[fit_inds_arr]
@@ -538,7 +671,6 @@ class ResonatorScatteringStore(pd.HDFStore):
                         fit_freqs = freqs
                         fit_phase = phase
                         
-                    # Fit cable delay parameters
                     if (tau is None) and (offset is None):
                         fit_func = self._line_func
                         popt, pcov = spopt.curve_fit(fit_func, fit_freqs, fit_phase)
@@ -557,12 +689,10 @@ class ResonatorScatteringStore(pd.HDFStore):
                         tau_fit = tau
                         offset_fit = offset 
                         
-                    # Apply calibration
                     line = self._line_func(freqs, tau_fit, offset_fit)
                     corrected_phase = phase - line
                     Ical, Qcal = mlin*np.cos(corrected_phase), mlin*np.sin(corrected_phase)
                     
-                    # Write calibrated data to temporary store
                     cal_df = pd.DataFrame(
                         {'frequency': freqs, 'I': Ical, 'Q': Qcal}, 
                         index=pd.MultiIndex.from_product(
@@ -572,7 +702,6 @@ class ResonatorScatteringStore(pd.HDFStore):
                     )
                     self.append(f"{tmp_out_prefix}/data", cal_df) 
                     
-                    # Write fitted parameters to temporary store
                     params_df = pd.DataFrame(
                         {'tau': tau_fit, 'cable_delay_offset': offset_fit}, 
                         index=pd.MultiIndex.from_product(
@@ -581,7 +710,6 @@ class ResonatorScatteringStore(pd.HDFStore):
                     ) 
                     self.append(f"{tmp_out_prefix}/cable_delay_params", params_df) 
                     
-                    # - Plotting - #
                     if plot:
                         plot_freqs = freqs*1e-9
                         color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap) 
@@ -591,13 +719,10 @@ class ResonatorScatteringStore(pd.HDFStore):
                         axs['iq_raw'].scatter(I, Q, color=color, marker='.')
                         axs['iq_cal'].scatter(Ical, Qcal, color=color, marker='.')
 
-                # - Move temporary groups into the final out_group ---------------------------- #
-                # Remove destination keys if overwriting
                 out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
                 for k in out_keys:
                     self.remove(k)
                     
-                # Rename temp groups
                 tmp_keys = [k for k in self.keys() if k.startswith(tmp_out_prefix)]
                 for k in tmp_keys:
                     sub_name = k.split('/')[-1]
@@ -605,11 +730,9 @@ class ResonatorScatteringStore(pd.HDFStore):
                     self.append(f"{out_group}/{sub_name}", df)
                     self.remove(k)
                     
-                # Update index cache for the new data group
                 self._get_index_arrays(f"{out_group}/data")
             
             except Exception as e:
-                # - Clean up the temp data groups if the fit errored - # 
                 for k in self.keys():
                     if k.startswith(tmp_out_prefix):
                         self.remove(k)
@@ -620,10 +743,35 @@ class ResonatorScatteringStore(pd.HDFStore):
     def calibrate_constant_scaling(self,
                 in_group, out_group,
                 a=None, alpha=None, phase_fit_kwargs=None,
-                inds=None, plot=False, frequency_bound=None,
+                inds=None, query=None, plot=False,
                 sweep_param=None, sweep_cmap='viridis', sweep_label=None, 
             ):
-            # - Format paths - #
+            """
+            Remove constant magnitude and phase offset scaling factors from the data.
+            
+            :param in_group: The group path from which to pull data.
+            :type in_group: str
+            :param out_group: The output group path for the calibrated data.
+            :type out_group: str
+            :param a: Fixed magnitude scaling factor. If None, it will be fitted.
+            :type a: float, optional
+            :param alpha: Fixed phase offset. If None, it will be fitted.
+            :type alpha: float, optional
+            :param phase_fit_kwargs: Keyword arguments for the internal centered phase fit.
+            :type phase_fit_kwargs: dict, optional
+            :param inds: Indices over which to perform the calibration.
+            :type inds: list or numpy.ndarray, optional
+            :param query: Optional pandas query string to filter traces and points.
+            :type query: str, optional
+            :param plot: Boolean to indicate if a plot should be generated.
+            :type plot: bool, optional
+            :param sweep_param: String to indicate a parameter that is swept over.
+            :type sweep_param: str, optional
+            :param sweep_cmap: Colormap to use.
+            :type sweep_cmap: str, optional
+            :param sweep_label: String label used to label the colorbar.
+            :type sweep_label: str, optional
+            """
             in_group = '/' + in_group.strip('/')
             out_group = '/' + out_group.strip('/')
             data_group = f"{in_group}/data"
@@ -639,15 +787,22 @@ class ResonatorScatteringStore(pd.HDFStore):
             if inds is None:
                 inds = np.arange(start_inds.shape[0])
                 
+            point_masks = None
+            if query is not None:
+                inds, point_masks = self.group_query(in_group, query, inds)
+                
             if sweep_param is None:
-                sweep_param_vals = np.arange(start_inds.shape[0])
+                sweep_param_vals = np.arange(start_inds.shape[0])[inds] if len(inds) > 0 else np.array([])
                 param = 'iter' 
             else:
                 subgroup, param = sweep_param.split('.') 
                 sweep_path = f"{in_group}/{subgroup}"
                 sweep_param_vals = self[sweep_path][param].values[inds]
                 
-            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+            if len(sweep_param_vals) > 0:
+                sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+            else:
+                sweep_min, sweep_max = 0, 1
 
             if plot:
                 fig, axs = self._configure_subplot_mosaic(
@@ -664,7 +819,6 @@ class ResonatorScatteringStore(pd.HDFStore):
                 ret = None
 
             try: 
-                # - Bulk copy metadata - #
                 target_indices = [(rg_arr[start_inds[i]], rgi_arr[start_inds[i]]) for i in inds]
                 meta_keys = [k for k in keys if k.startswith(in_group + '/') and not k.endswith('/data')]
                 for m_key in meta_keys:
@@ -673,13 +827,21 @@ class ResonatorScatteringStore(pd.HDFStore):
                     sub_name = m_key.split('/')[-1]
                     self.put(f"{tmp_out_prefix}/{sub_name}", subset_df, format='table')
                     
-                j = 0 
                 for i, val in zip(inds, sweep_param_vals):
                     ind = start_inds[i]
                     rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
-                    fb = frequency_bound[j] if (frequency_bound is not None and len(frequency_bound) > 2) else frequency_bound
                     
-                    data = self._get_group_values(data_group, i, frequency_bound=fb)
+                    data = self._get_group_values(data_group, i)
+                    
+                    if point_masks is not None and i in point_masks:
+                        valid_rows = point_masks[i]
+                        if 'RecordRow' in data.index.names:
+                            mask = data.index.get_level_values('RecordRow').isin(valid_rows)
+                            data = data.loc[mask]
+                            
+                    if data.empty:
+                        continue
+                        
                     I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
                     mlin = np.sqrt(I**2 + Q**2) 
                     phase = np.unwrap(np.arctan2(Q, I)) 
@@ -733,9 +895,7 @@ class ResonatorScatteringStore(pd.HDFStore):
                         [[rg_val], [rgi_val]], names=['RecordGroup', 'RecordGroupInd']
                     ))
                     self.append(f"{tmp_out_prefix}/constant_scaling_params", cal_params_df)
-                    j += 1
 
-                # - Move to final group - #
                 out_keys = [k for k in self.keys() if k.startswith(out_group + '/')]
                 for k in out_keys:
                     self.remove(k)
@@ -757,10 +917,40 @@ class ResonatorScatteringStore(pd.HDFStore):
 
     def calibrate_polymag_background(self,
                 in_group, out_group,
-                frequency_bound=None, lower_frequency_bound=None, upper_frequency_bound=None, 
-                inds=None, degree=2, fixed_coeffs=None, domain=None,
+                lower_frequency_bound=None, upper_frequency_bound=None, 
+                inds=None, query=None, degree=2, fixed_coeffs=None, domain=None,
                 plot=False, sweep_param=None, sweep_cmap='viridis', sweep_label=None, 
             ):
+            """
+            Calibrate magnitude background by fitting a polynomial to the non-resonant regions.
+            
+            :param in_group: The group path from which to pull data.
+            :type in_group: str
+            :param out_group: The output group path to write calibrated data into.
+            :type out_group: str
+            :param lower_frequency_bound: Lower region to fit the polynomial over.
+            :type lower_frequency_bound: tuple, optional
+            :param upper_frequency_bound: Upper region to fit the polynomial over.
+            :type upper_frequency_bound: tuple, optional
+            :param inds: Indices over which to perform the calibration.
+            :type inds: list or numpy.ndarray, optional
+            :param query: Optional pandas query string to filter traces and points.
+            :type query: str, optional
+            :param degree: Polynomial degree to fit. Defaults to 2.
+            :type degree: int, optional
+            :param fixed_coeffs: Fixed coefficients for the polynomial if skipping the fit.
+            :type fixed_coeffs: array-like, optional
+            :param domain: Evaluation domain for the polynomial if providing fixed coefficients.
+            :type domain: tuple, optional
+            :param plot: Generate a plot of the calibration.
+            :type plot: bool, optional
+            :param sweep_param: String to indicate a parameter that is swept over.
+            :type sweep_param: str, optional
+            :param sweep_cmap: Colormap to use.
+            :type sweep_cmap: str, optional
+            :param sweep_label: String label used to label the colorbar.
+            :type sweep_label: str, optional
+            """
             in_group = '/' + in_group.strip('/')
             out_group = '/' + out_group.strip('/')
             data_group = f"{in_group}/data"
@@ -775,15 +965,22 @@ class ResonatorScatteringStore(pd.HDFStore):
             if inds is None:
                 inds = np.arange(start_inds.shape[0])
                 
+            point_masks = None
+            if query is not None:
+                inds, point_masks = self.group_query(in_group, query, inds)
+                
             if sweep_param is None:
-                sweep_param_vals = np.arange(start_inds.shape[0])
+                sweep_param_vals = np.arange(start_inds.shape[0])[inds] if len(inds) > 0 else np.array([])
                 param = 'iter' 
             else:
                 subgroup, param = sweep_param.split('.') 
                 sweep_path = f"{in_group}/{subgroup}"
                 sweep_param_vals = self[sweep_path][param].values[inds]
                 
-            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+            if len(sweep_param_vals) > 0:
+                sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+            else:
+                sweep_min, sweep_max = 0, 1
 
             if plot:
                 fig, axs = self._configure_subplot_mosaic(
@@ -809,7 +1006,17 @@ class ResonatorScatteringStore(pd.HDFStore):
                     ind = start_inds[i]
                     rg_val, rgi_val = rg_arr[ind], rgi_arr[ind] 
                     
-                    data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+                    data = self._get_group_values(data_group, i)
+                    
+                    if point_masks is not None and i in point_masks:
+                        valid_rows = point_masks[i]
+                        if 'RecordRow' in data.index.names:
+                            mask = data.index.get_level_values('RecordRow').isin(valid_rows)
+                            data = data.loc[mask]
+                            
+                    if data.empty:
+                        continue
+                        
                     I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
                     mlog = (1 + 1*self.power)*10*np.log10(np.sqrt(I**2 + Q**2))
                     phase = np.unwrap(np.arctan2(Q, I)) 
@@ -894,10 +1101,40 @@ class ResonatorScatteringStore(pd.HDFStore):
 
     def calibrate_polyphase_background(self,
             in_group, out_group,
-            frequency_bound=None, lower_frequency_bound=None, upper_frequency_bound=None,
-            inds=None, degree=2, fixed_coeffs=None, domain=None, plot=False, 
+            lower_frequency_bound=None, upper_frequency_bound=None,
+            inds=None, query=None, degree=2, fixed_coeffs=None, domain=None, plot=False, 
             sweep_param=None, sweep_cmap='viridis', sweep_label=None,
         ):
+        """
+        Calibrate phase background by fitting a polynomial to the non-resonant regions.
+        
+        :param in_group: The group path from which to pull data.
+        :type in_group: str
+        :param out_group: The output group path to write calibrated data into.
+        :type out_group: str
+        :param lower_frequency_bound: Lower region to fit the polynomial over.
+        :type lower_frequency_bound: tuple, optional
+        :param upper_frequency_bound: Upper region to fit the polynomial over.
+        :type upper_frequency_bound: tuple, optional
+        :param inds: Indices over which to perform the calibration.
+        :type inds: list or numpy.ndarray, optional
+        :param query: Optional pandas query string to filter traces and points.
+        :type query: str, optional
+        :param degree: Polynomial degree to fit. Defaults to 2.
+        :type degree: int, optional
+        :param fixed_coeffs: Fixed coefficients for the polynomial if skipping the fit.
+        :type fixed_coeffs: array-like, optional
+        :param domain: Evaluation domain for the polynomial if providing fixed coefficients.
+        :type domain: tuple, optional
+        :param plot: Generate a plot of the calibration.
+        :type plot: bool, optional
+        :param sweep_param: String to indicate a parameter that is swept over.
+        :type sweep_param: str, optional
+        :param sweep_cmap: Colormap to use.
+        :type sweep_cmap: str, optional
+        :param sweep_label: String label used to label the colorbar.
+        :type sweep_label: str, optional
+        """
         in_group = '/' + in_group.strip('/')
         out_group = '/' + out_group.strip('/')
         data_group = f"{in_group}/data"
@@ -912,15 +1149,22 @@ class ResonatorScatteringStore(pd.HDFStore):
         if inds is None:
             inds = np.arange(start_inds.shape[0])
             
+        point_masks = None
+        if query is not None:
+            inds, point_masks = self.group_query(in_group, query, inds)
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(start_inds.shape[0])
+            sweep_param_vals = np.arange(start_inds.shape[0])[inds] if len(inds) > 0 else np.array([])
             param = 'iter' 
         else:
             subgroup, param = sweep_param.split('.') 
             sweep_path = f"{in_group}/{subgroup}"
             sweep_param_vals = self[sweep_path][param].values[inds]
             
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+        if len(sweep_param_vals) > 0:
+            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+        else:
+            sweep_min, sweep_max = 0, 1
 
         if plot:
             fig, axs = self._configure_subplot_mosaic(
@@ -946,7 +1190,17 @@ class ResonatorScatteringStore(pd.HDFStore):
                 ind = start_inds[i]
                 rg_val, rgi_val = rg_arr[ind], rgi_arr[ind] 
                 
-                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+                data = self._get_group_values(data_group, i)
+                
+                if point_masks is not None and i in point_masks:
+                    valid_rows = point_masks[i]
+                    if 'RecordRow' in data.index.names:
+                        mask = data.index.get_level_values('RecordRow').isin(valid_rows)
+                        data = data.loc[mask]
+                        
+                if data.empty:
+                    continue
+                    
                 I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
                 mlin = np.sqrt(I**2 + Q**2) 
                 phase = np.unwrap(np.arctan2(Q, I)) 
@@ -1028,9 +1282,33 @@ class ResonatorScatteringStore(pd.HDFStore):
         return ret
 
     def calibrate_from_file(self, filepath, in_group, out_group,
-            bg_group='/base/data', frequency_bound=None, inds=None, plot=False,
+            bg_group='/base/data', inds=None, query=None, plot=False,
             sweep_param=None, sweep_cmap='viridis', sweep_label=None, 
         ):
+        """
+        Calibrate data using a trace from a separate background reference file.
+        
+        :param filepath: Path to the HDF5 file containing the background reference data.
+        :type filepath: str
+        :param in_group: The group path from which to pull data.
+        :type in_group: str
+        :param out_group: The output group path to write calibrated data into.
+        :type out_group: str
+        :param bg_group: The group path in the reference file pointing to the background trace.
+        :type bg_group: str, optional
+        :param inds: Indices over which to perform the calibration.
+        :type inds: list or numpy.ndarray, optional
+        :param query: Optional pandas query string to filter traces and points.
+        :type query: str, optional
+        :param plot: Generate a plot of the calibration.
+        :type plot: bool, optional
+        :param sweep_param: String to indicate a parameter that is swept over.
+        :type sweep_param: str, optional
+        :param sweep_cmap: Colormap to use.
+        :type sweep_cmap: str, optional
+        :param sweep_label: String label used to label the colorbar.
+        :type sweep_label: str, optional
+        """
         in_group = '/' + in_group.strip('/')
         out_group = '/' + out_group.strip('/')
         data_group = f"{in_group}/data"
@@ -1049,9 +1327,6 @@ class ResonatorScatteringStore(pd.HDFStore):
             bg_data = bg_store.select(bg_group)
             
         bg_I, bg_Q, bg_freqs = bg_data.I.values, bg_data.Q.values, bg_data.frequency.values 
-        if frequency_bound is not None:
-            bg_inds = np.where((frequency_bound[0] <= bg_freqs) * (bg_freqs <= frequency_bound[1]))[0] 
-            bg_I, bg_Q, bg_freqs = bg_I[bg_inds], bg_Q[bg_inds], bg_freqs[bg_inds] 
             
         bg_mlin = np.sqrt(bg_I**2 + bg_Q**2) 
         bg_mlog = (1 + 1*self.power)*10*np.log10(bg_mlin) 
@@ -1060,15 +1335,22 @@ class ResonatorScatteringStore(pd.HDFStore):
         if inds is None:
             inds = np.arange(start_inds.shape[0])
             
+        point_masks = None
+        if query is not None:
+            inds, point_masks = self.group_query(in_group, query, inds)
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(start_inds.shape[0])
+            sweep_param_vals = np.arange(start_inds.shape[0])[inds] if len(inds) > 0 else np.array([])
             param = 'iter' 
         else:
             subgroup, param = sweep_param.split('.') 
             sweep_path = f"{in_group}/{subgroup}"
             sweep_param_vals = self[sweep_path][param].values[inds]
             
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+        if len(sweep_param_vals) > 0:
+            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+        else:
+            sweep_min, sweep_max = 0, 1
 
         if plot:
             fig, axs = self._configure_subplot_mosaic(
@@ -1098,7 +1380,17 @@ class ResonatorScatteringStore(pd.HDFStore):
                 ind = start_inds[i]
                 rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
                 
-                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+                data = self._get_group_values(data_group, i)
+                
+                if point_masks is not None and i in point_masks:
+                    valid_rows = point_masks[i]
+                    if 'RecordRow' in data.index.names:
+                        mask = data.index.get_level_values('RecordRow').isin(valid_rows)
+                        data = data.loc[mask]
+                        
+                if data.empty:
+                    continue
+                    
                 I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
                 mlin = np.sqrt(I**2 + Q**2)
                 mlog = (1 + 1*self.power)*10*np.log10(mlin) 
@@ -1152,306 +1444,36 @@ class ResonatorScatteringStore(pd.HDFStore):
             raise e
         return ret
 
-    # - PLOTTING FUNCTIONS ----------------------------------------------------------------------------- #
-    def plot_mag_phase(self,
-            in_group='base', frequency_bound=None, inds=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
-        ):
-        """ Plot the magnitude and phase for a specified group in the hierarchy.
-        
-        :param in_group: The group path from which to pull data (e.g., 'base' or 'process_0').
-        :param frequency_bound: Frequency range over which to plot.
-        :param inds: Record start indices to plot over. If None, all available data will be plotted.
-        :param sweep_param: String formatted as 'subgroup.column' to map uniqueness over.
-        :param sweep_cmap: Colormap used to indicate the value of the swept parameter.
-        :param sweep_label: String label used to indicate the colorbar.
-        """
-        # Format paths for the targeted hierarchy
-        in_group = '/' + in_group.strip('/')
-        data_group = f"{in_group}/data"
-        
-        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
-
-        # - apply indices --------------- #
-        if inds is None:
-            inds = np.arange(start_inds.shape[0])
-            
-        if sweep_param is None:
-            sweep_param_vals = np.arange(start_inds.shape[0])
-            param = 'iter' 
-        else:
-            subgroup, param = sweep_param.split('.') 
-            sweep_group_path = f"{in_group}/{subgroup}"
-            sweep_param_vals = self[sweep_group_path][param].values[inds]
-            
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
-
-        # - configure figure and axes objects - #
-        fig, axs = self._configure_subplot_mosaic(
-            [['mag'], ['phase']],
-            sweep_param_vals,
-            width_ratios=[0.95, 0.05],
-            sweep_label=sweep_label,
-            sweep_cmap=sweep_cmap,
-        )
-            
-        axs['mag'].set_xticks([]) 
-        axs['phase'].set_xlabel('Frequency (GHz)')
-        axs['mag'].set_ylabel(self.mag_ylabel)
-        axs['phase'].set_ylabel(self.phase_ylabel)
-
-        # - plot - #
-        for i, val in zip(inds, sweep_param_vals):
-            # Fetch data directly from the target group
-            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
-            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
-            freqs *= 1e-9 
-            mlog = (1 + self.power*1)*10*np.log10(np.sqrt(I**2 + Q**2)) 
-            phase = np.unwrap(np.arctan2(Q, I)) 
-            
-            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
-            axs['mag'].plot(freqs, mlog, color=color)
-            axs['phase'].plot(freqs, phase, color=color) 
-
-        return fig, axs
-
-    def plot_mag(self,
-            in_group='base', frequency_bound=None, inds=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
-        ): 
-        """ Plot the magnitude for a specified group in the hierarchy. """
-        in_group = '/' + in_group.strip('/')
-        data_group = f"{in_group}/data"
-        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
-
-        # - apply indices --------------- #
-        if inds is None:
-            inds = np.arange(start_inds.shape[0])
-            
-        if sweep_param is None:
-            sweep_param_vals = np.arange(start_inds.shape[0])
-            param = 'iter' 
-        else:
-            subgroup, param = sweep_param.split('.') 
-            sweep_group_path = f"{in_group}/{subgroup}"
-            sweep_param_vals = self[sweep_group_path][param].values[inds]
-            
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
-
-        # - configure figure and axes objects - #
-        fig, axs = self._configure_subplot_mosaic(
-            [['mag']], sweep_param_vals, width_ratios=[0.95, 0.05],
-            sweep_label=sweep_label, sweep_cmap=sweep_cmap,
-        )
-        axs['mag'].set(xlabel='Frequency (GHz)', ylabel=self.mag_ylabel) 
-
-        # - plot - #
-        for i, val in zip(inds, sweep_param_vals):
-            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
-            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
-            freqs *= 1e-9 
-            mlog = (1 + self.power*1)*10*np.log10(np.sqrt(I**2 + Q**2)) 
-            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
-            axs['mag'].plot(freqs, mlog, color=color)
-
-        return fig, axs
-
-    def plot_phase(self,
-            in_group='base', frequency_bound=None, inds=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
-        ): 
-        """ Plot the phase for a specified group in the hierarchy. """
-        in_group = '/' + in_group.strip('/')
-        data_group = f"{in_group}/data"
-        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
-
-        # - apply indices --------------- #
-        if inds is None:
-            inds = np.arange(start_inds.shape[0])
-            
-        if sweep_param is None:
-            sweep_param_vals = np.arange(start_inds.shape[0])
-            param = 'iter' 
-        else:
-            subgroup, param = sweep_param.split('.') 
-            sweep_group_path = f"{in_group}/{subgroup}"
-            sweep_param_vals = self[sweep_group_path][param].values[inds]
-            
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
-
-        # - configure figure and axes objects - #
-        fig, axs = self._configure_subplot_mosaic(
-            [['phase']], sweep_param_vals, width_ratios=[0.95, 0.05],
-            sweep_label=sweep_label, sweep_cmap=sweep_cmap,
-        )
-        axs['phase'].set(xlabel='Frequency (GHz)', ylabel=self.phase_ylabel) 
-
-        # - plot - #
-        for i, val in zip(inds, sweep_param_vals):
-            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
-            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
-            freqs *= 1e-9 
-            phase = np.unwrap(np.arctan2(Q, I)) 
-            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap)
-            axs['phase'].plot(freqs, phase, color=color)
-
-        return fig, axs
-
-    def plot_iq(self,
-            in_group='base', frequency_bound=None, inds=None,
-            sweep_param=None, sweep_cmap='viridis', sweep_label=None,
-        ):
-        """ Plot IQ data for a specified group in the hierarchy. """
-        in_group = '/' + in_group.strip('/')
-        data_group = f"{in_group}/data"
-        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
-
-        # - apply indices --------------- #
-        if inds is None:
-            inds = np.arange(start_inds.shape[0])
-            
-        if sweep_param is None:
-            sweep_param_vals = np.arange(start_inds.shape[0])
-            param = 'iter' 
-        else:
-            subgroup, param = sweep_param.split('.') 
-            sweep_group_path = f"{in_group}/{subgroup}"
-            sweep_param_vals = self[sweep_group_path][param].values[inds]
-            
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
-
-        # - configure figure and axes objects - #
-        fig, axs = self._configure_subplot_mosaic(
-            [['iq']], sweep_param_vals, width_ratios=[0.95, 0.05],
-            sweep_label=sweep_label, sweep_cmap=sweep_cmap,
-        )
-        axs['iq'].set(xlabel='I', ylabel='Q')
-
-        # - plot - #
-        for i, val in zip(inds, sweep_param_vals):
-            color = self._compute_color(val, sweep_min, sweep_max, sweep_cmap) 
-            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
-            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values 
-            axs['iq'].scatter(I, Q, marker='.', color=color)
-
-        return fig, axs
-
-    def plot_res_params(self, 
-            in_group='base', inds=None, xparam=None, xparam_label=None, 
-            frequency_scale='GHz', frequency_offset=0, params_name='res_params'
-        ):
-        """ Plot the fit resonator parameters on a single summary figure. """
-        in_group = '/' + in_group.strip('/')
-        data_group = f"{in_group}/data"
-        params_group = f"{in_group}/{params_name}"
-        
-        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
-        
-        if inds is None:
-            inds = np.arange(start_inds.shape[0])
-
-        # - configure plot - # 
-        fig, axs = plt.subplot_mosaic(
-            [['fr', 'Ql'], 
-             ['Q', 'Q']],
-        )
-        axs['fr'].set(
-            xlabel='' if xparam_label is None else xparam_label,
-            ylabel=r'$f_r$ (%s)' % frequency_scale,
-        )
-        axs['Ql'].set(
-            xlabel='' if xparam_label is None else xparam_label,
-            ylabel=r'$Q_l$', 
-        )
-        axs['Q'].set(
-            xlabel='' if xparam_label is None else xparam_label,
-            ylabel=r'$Q$', 
-        )
-
-        # - extract resonator parameters and x sweep value - #
-        res_params = self._get_group_values(params_group, inds, index_group=data_group) 
-        fr = res_params.fr.values
-        ql = res_params.Ql.values
-        qi, qc = res_params.Qi.values, res_params.Qc.values.real 
-        
-        # - check for error columns - #
-        fr_err = res_params.fr_err.values if 'fr_err' in res_params.columns else None
-        ql_err = res_params.Ql_err.values if 'Ql_err' in res_params.columns else None
-        qi_err = res_params.Qi_err.values if 'Qi_err' in res_params.columns else None
-        qc_err = res_params.Qc_err.values if 'Qc_err' in res_params.columns else None
-        
-        x_err = None
-        if xparam is None: 
-            x = np.arange(res_params.shape[0])[inds]
-        else:
-            subgroup, param = xparam.split('.') 
-            sweep_group_path = f"{in_group}/{subgroup}"
-            group_df = self._get_group_values(sweep_group_path, inds, index_group=data_group) 
-            x = group_df[param].values
-            
-            # Check for x error column
-            if f"{param}_err" in group_df.columns:
-                x_err = group_df[f"{param}_err"].values
-
-        # - formatting logic - #
-        fr_multiply = {
-            'GHz': 1e-9,
-            'MHz': 1e-6,
-            'kHz': 1e-3,
-            'Hz': 1,
-        }[frequency_scale]
-        
-        # Standard error scales multiplicatively, but ignores constant offsets
-        if fr_err is not None:
-            fr_err = fr_err * fr_multiply
-
-        # - plot - #
-        axs['fr'].errorbar(x, (fr-frequency_offset)*fr_multiply, xerr=x_err, yerr=fr_err, fmt='o')
-        axs['Ql'].errorbar(x, ql, xerr=x_err, yerr=ql_err, fmt='o')
-        axs['Q'].errorbar(x, qi, xerr=x_err, yerr=qi_err, fmt='o', label=r'$Q_i$')
-        axs['Q'].errorbar(x, qc, xerr=x_err, yerr=qc_err, fmt='o', label=r'$Q_c$')
-        axs['Q'].legend()
-
-        return fig, axs
-
-    def plot_params(self, in_group, param_x, param_y, param_x_label=None, param_y_label=None, scatter=True, plot_kwargs=None):
-        """ Plot one or more parameters on a y axis against a single parameter on an x axis. """
-        if plot_kwargs is None:
-            plot_kwargs = {}
-            
-        in_group = '/' + in_group.strip('/')
-        
-        x_subgroup, x_param = param_x.split('.') 
-        y_subgroup, y_param = param_y.split('.') 
-        
-        x_path = f"{in_group}/{x_subgroup}"
-        y_path = f"{in_group}/{y_subgroup}"
-        
-        xvals = self[x_path][x_param].values 
-        yvals = self[y_path][y_param].values
-
-        fig, ax = plt.subplots()
-        ax.set(
-            xlabel=param_x if param_x_label is None else param_x_label,
-            ylabel=param_y if param_y_label is None else param_y_label,
-        )
-
-        if scatter:
-            ax.scatter(xvals, yvals, **plot_kwargs)
-        else:
-            ax.plot(xvals, yvals, **plot_kwargs)
-
-        return fig, ax
-
-# - RESONATOR PARAMETER FITTING -------------------------------------------------------------- #
     # - RESONATOR PARAMETER FITTING -------------------------------------------------------------- #
     def fit_res_params(self,
-            in_group, frequency_bound=None, inds=None, plot=False, plot_text=False, 
+            in_group, inds=None, query=None, plot=False, plot_text=False, 
             phase_fit_kwargs=None, fixed_Qc=None, sweep_param=None, 
             sweep_cmap='viridis', sweep_label=None, 
         ):
-        """ Fit resonator parameters and standard errors. Writes purely to `in_group/res_params`. """
+        """ 
+        Fit resonator parameters and standard errors. Writes purely to `in_group/res_params`. 
         
+        :param in_group: The group path from which to pull data (e.g., 'base').
+        :type in_group: str
+        :param inds: Record start indices to process over. If None, processes all available data.
+        :type inds: list or numpy.ndarray, optional
+        :param query: Optional pandas query string to filter traces and points.
+        :type query: str, optional
+        :param plot: Generate a plot of the fits.
+        :type plot: bool, optional
+        :param plot_text: Overlay the fit parameters as text on the plot.
+        :type plot_text: bool, optional
+        :param phase_fit_kwargs: Keyword arguments for the centered phase fit.
+        :type phase_fit_kwargs: dict, optional
+        :param fixed_Qc: Optionally fix the coupling quality factor.
+        :type fixed_Qc: float, optional
+        :param sweep_param: String to indicate a parameter that is swept over.
+        :type sweep_param: str, optional
+        :param sweep_cmap: Colormap to use.
+        :type sweep_cmap: str, optional
+        :param sweep_label: String label used to label the colorbar.
+        :type sweep_label: str, optional
+        """
         in_group = '/' + in_group.strip('/')
         data_group = f"{in_group}/data"
         
@@ -1460,15 +1482,22 @@ class ResonatorScatteringStore(pd.HDFStore):
         if inds is None:
             inds = np.arange(start_inds.shape[0])
             
+        point_masks = None
+        if query is not None:
+            inds, point_masks = self.group_query(in_group, query, inds)
+            
         if sweep_param is None:
-            sweep_param_vals = np.arange(start_inds.shape[0])
+            sweep_param_vals = np.arange(start_inds.shape[0])[inds] if len(inds) > 0 else np.array([])
             param = 'iter' 
         else:
             subgroup, param = sweep_param.split('.') 
             sweep_path = f"{in_group}/{subgroup}"
             sweep_param_vals = self[sweep_path][param].values[inds]
             
-        sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+        if len(sweep_param_vals) > 0:
+            sweep_min, sweep_max = sweep_param_vals.min(), sweep_param_vals.max() 
+        else:
+            sweep_min, sweep_max = 0, 1
 
         if plot:
             if plot_text:
@@ -1491,14 +1520,12 @@ class ResonatorScatteringStore(pd.HDFStore):
 
         num_inds = len(inds)
         
-        # Pre-allocate numpy arrays for speed and error tracking
         Ql_out = np.empty(num_inds, dtype=float)
         Qi_out = np.empty(num_inds, dtype=float)
         Qc_out = np.empty(num_inds, dtype=complex)
         phi_out = np.empty(num_inds, dtype=float)
         fr_out = np.empty(num_inds, dtype=float)
         
-        # Note: Standard errors are real magnitudes, even for complex parameters like Qc
         Ql_err_out = np.empty(num_inds, dtype=float)
         Qi_err_out = np.empty(num_inds, dtype=float)
         Qc_err_out = np.empty(num_inds, dtype=float)
@@ -1513,8 +1540,15 @@ class ResonatorScatteringStore(pd.HDFStore):
             ind = start_inds[i]
             rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
             
-            data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
-            if len(data) == 0:
+            data = self._get_group_values(data_group, i)
+            
+            if point_masks is not None and i in point_masks:
+                valid_rows = point_masks[i]
+                if 'RecordRow' in data.index.names:
+                    mask = data.index.get_level_values('RecordRow').isin(valid_rows)
+                    data = data.loc[mask]
+                    
+            if data.empty:
                 continue
                 
             I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
@@ -1529,23 +1563,18 @@ class ResonatorScatteringStore(pd.HDFStore):
             
             phase_fit_kwargs = {} if phase_fit_kwargs is None else phase_fit_kwargs 
             
-            # - Fit phase and safely extract covariance errors - #
             try:
                 params, pcov = self._centered_phase_fit(freqs, centered_phase, **phase_fit_kwargs)
                 theta0, Ql, fr = params
                 
-                # Check for bad matrix conditions
                 if np.any(np.isinf(pcov)) or np.any(np.isnan(pcov)):
                     raise ValueError("Invalid covariance matrix")
                     
-                # Prevent negative variances due to precision issues
                 perr = np.sqrt(np.maximum(np.diag(pcov), 0))
                 theta0_err, Ql_err, fr_err = perr
             except Exception:
-                # Skip traces where curve_fit totally fails
                 continue
             
-            # - Calculate physical variables & propagate errors - #
             phi = -np.arcsin(yc/r)
             if self.geometry == 'hanger': 
                 if fixed_Qc is None: 
@@ -1553,7 +1582,6 @@ class ResonatorScatteringStore(pd.HDFStore):
                     Qcr = np.real(Qc)
                     Qi = 1 / ((1/Ql) - (1/Qcr))
                     
-                    # Propagate error linearly relative to Ql
                     Qi_err = np.abs(Qi * (Ql_err / Ql)) if Ql != 0 else np.nan
                     Qc_err = np.abs(Qc * (Ql_err / Ql)) if Ql != 0 else np.nan
                 else:
@@ -1579,7 +1607,6 @@ class ResonatorScatteringStore(pd.HDFStore):
                     Qi_err = 0.0
                     Qc_err = 0.0
                     
-            # Populate pre-allocated arrays
             Ql_out[valid_count] = Ql
             Qi_out[valid_count] = Qi
             Qc_out[valid_count] = Qc
@@ -1616,7 +1643,6 @@ class ResonatorScatteringStore(pd.HDFStore):
                     axs['params'].text(0.1, 0.2, params_str, fontsize=14)
 
         if valid_count > 0:
-            # Build final array efficiently
             res_params_df = pd.DataFrame({
                 'Ql': Ql_out[:valid_count], 
                 'Qi': Qi_out[:valid_count], 
@@ -1642,13 +1668,17 @@ class ResonatorScatteringStore(pd.HDFStore):
 
         return ret
 
-    def find_min_mag_fr(self, in_group, frequency_bound=None, inds=None):
-            """ Find the resonance frequency by identifying the minimum magnitude of the I/Q data.
+    def find_min_mag_fr(self, in_group, inds=None, query=None):
+            """ 
+            Find the resonance frequency by identifying the minimum magnitude of the I/Q data.
             Writes the results to `in_group/min_mag_params`.
             
             :param in_group: The input group path from which to pull data (e.g., 'base').
-            :param frequency_bound: Optional tuple of (min_freq, max_freq) to constrain the search.
-            :param inds: Record start indices to process over. If None, all available data is processed.
+            :type in_group: str
+            :param inds: Record start indices to process over. If None, processes all available data.
+            :type inds: list or numpy.ndarray, optional
+            :param query: Optional pandas query string to filter traces and points.
+            :type query: str, optional
             """
             in_group = '/' + in_group.strip('/')
             data_group = f"{in_group}/data"
@@ -1657,10 +1687,13 @@ class ResonatorScatteringStore(pd.HDFStore):
 
             if inds is None:
                 inds = np.arange(start_inds.shape[0])
+                
+            point_masks = None
+            if query is not None:
+                inds, point_masks = self.group_query(in_group, query, inds)
 
             num_inds = len(inds)
             
-            # Pre-allocate numpy arrays for speed
             fr_out = np.empty(num_inds, dtype=float)
             rg_out = np.empty(num_inds, dtype=object)
             rgi_out = np.empty(num_inds, dtype=object)
@@ -1671,45 +1704,165 @@ class ResonatorScatteringStore(pd.HDFStore):
                 ind = start_inds[i]
                 rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
                 
-                # Fetch data using our standard hierarchical helper
-                data = self._get_group_values(data_group, i, frequency_bound=frequency_bound)
+                data = self._get_group_values(data_group, i)
                 
-                if len(data) == 0:
+                if point_masks is not None and i in point_masks:
+                    valid_rows = point_masks[i]
+                    if 'RecordRow' in data.index.names:
+                        mask = data.index.get_level_values('RecordRow').isin(valid_rows)
+                        data = data.loc[mask]
+                        
+                if data.empty:
                     continue
                     
                 I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
                 
-                # Compute linear magnitude
                 mlin = np.sqrt(I**2 + Q**2)
                 
-                # Identify the frequency at the minimum magnitude
                 min_idx = np.argmin(mlin)
                 
-                # Populate pre-allocated arrays
                 fr_out[valid_count] = freqs[min_idx]
                 rg_out[valid_count] = rg_val
                 rgi_out[valid_count] = rgi_val
                 
                 valid_count += 1
 
-            # Build the DataFrame and save it back to the in_group
             if valid_count > 0:
-                # Slice arrays to only include valid, processed traces
                 fr_out = fr_out[:valid_count]
                 rg_out = rg_out[:valid_count]
                 rgi_out = rgi_out[:valid_count]
                 
                 min_mag_df = pd.DataFrame({'fr': fr_out})
                 
-                # from_arrays is generally much faster than from_tuples
                 min_mag_df.index = pd.MultiIndex.from_arrays(
                     [rg_out, rgi_out], names=['RecordGroup', 'RecordGroupInd']
                 )
                 
                 out_path = f"{in_group}/min_mag_params"
                 
-                # Safely overwrite if the dataset already exists
                 if out_path in self.keys():
                     self.remove(out_path)
                     
                 self.append(out_path, min_mag_df)
+
+    def find_max_mag_bw(self, in_group='base', inds=None, query=None):
+        """
+        Find the resonance frequency (peak), bandwidth (FWHM), and Quality Factor (Q) 
+        for transmission data. The bandwidth is calculated at the half-power level 
+        (max_magnitude / sqrt(2)) using linear interpolation.
+        
+        Writes the results to `in_group/max_mag_params`.
+
+        :param in_group: The input group path from which to pull data (e.g., 'base').
+        :type in_group: str
+        :param inds: Record start indices to process over. If None, processes all available data.
+        :type inds: list or numpy.ndarray, optional
+        :param query: Optional pandas query string to filter traces and points.
+        :type query: str, optional
+        """
+        in_group = '/' + in_group.strip('/')
+        data_group = f"{in_group}/data"
+        
+        # Get structural index arrays
+        rg_arr, rgi_arr, rr_arr, start_inds = self._get_index_arrays(data_group)
+
+        if inds is None:
+            inds = np.arange(start_inds.shape[0])
+            
+        point_masks = None
+        if query is not None:
+            inds, point_masks = self.group_query(in_group, query, inds)
+
+        num_inds = len(inds)
+        
+        # Pre-allocate arrays for performance
+        max_out = np.empty(num_inds, dtype=float)
+        f_max_out = np.empty(num_inds, dtype=float)
+        bw_out = np.empty(num_inds, dtype=float)
+        q_out = np.empty(num_inds, dtype=float)
+        rg_out = np.empty(num_inds, dtype=object)
+        rgi_out = np.empty(num_inds, dtype=object)
+        
+        valid_count = 0
+
+        for i in inds:
+            ind = start_inds[i]
+            rg_val, rgi_val = rg_arr[ind], rgi_arr[ind]
+            
+            data = self._get_group_values(data_group, i)
+            
+            if point_masks is not None and i in point_masks:
+                valid_rows = point_masks[i]
+                if 'RecordRow' in data.index.names:
+                    mask = data.index.get_level_values('RecordRow').isin(valid_rows)
+                    data = data.loc[mask]
+                    
+            if data.empty or len(data) < 3:
+                continue
+                
+            I, Q, freqs = data.I.values, data.Q.values, data.frequency.values
+            mag = np.sqrt(I**2 + Q**2)
+            
+            # 1. Find peak frequency
+            max_mag = mag.max()
+            max_idx = np.argmax(mag)
+            m_max = mag[max_idx]
+            f_max = freqs[max_idx]
+            
+            # 2. Define half-power target (magnitude / sqrt(2))
+            target = m_max / np.sqrt(2)
+            
+            # 3. Find bandwidth via interpolation
+            mag_left = mag[:max_idx+1]
+            freq_left = freqs[:max_idx+1]
+            mag_right = mag[max_idx:]
+            freq_right = freqs[max_idx:]
+            
+            try:
+                # Interpolate to find f_low and f_high
+                f_low = np.interp(target, mag_left, freq_left)
+                f_high = np.interp(target, mag_right[::-1], freq_right[::-1])
+                
+                bw = f_high - f_low
+                q_val = f_max / bw if bw != 0 else np.nan
+            except Exception:
+                bw, q_val = np.nan, np.nan
+
+            # Store results in pre-allocated arrays
+            max_out[valid_count] = max_mag 
+            f_max_out[valid_count] = f_max
+            bw_out[valid_count] = bw
+            q_out[valid_count] = q_val
+            rg_out[valid_count] = rg_val
+            rgi_out[valid_count] = rgi_val
+            
+            valid_count += 1
+
+        if valid_count > 0:
+            # Slice arrays to the actual number of valid records processed
+            max_out = max_out[:valid_count] 
+            f_max_out = f_max_out[:valid_count]
+            bw_out = bw_out[:valid_count]
+            q_out = q_out[:valid_count]
+            rg_out = rg_out[:valid_count]
+            rgi_out = rgi_out[:valid_count]
+            
+            # Create result DataFrame
+            max_mag_df = pd.DataFrame({
+                'max_mag': max_out, 
+                'f_max': f_max_out,
+                'bw': bw_out,
+                'Q': q_out
+            })
+            
+            max_mag_df.index = pd.MultiIndex.from_arrays(
+                [rg_out, rgi_out], names=['RecordGroup', 'RecordGroupInd']
+            )
+            
+            out_path = f"{in_group}/max_mag_params"
+            
+            # Parameter-only output: Replace existing results in the same group
+            if out_path in self.keys():
+                self.remove(out_path)
+                
+            self.append(out_path, max_mag_df)
